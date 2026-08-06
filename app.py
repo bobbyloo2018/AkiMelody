@@ -41,9 +41,12 @@ log = logging.getLogger("akimelody")
 APP_VERSION = "1.0.0"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
-# AKI_UPDATE_REPO in the environment (e.g. "AkiMelody/AkiMelody").
+# AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
+# publishes releases to (bobbyloo2018/AkiMelody), otherwise the app queries a
+# non-existent repo, GitHub returns 404, and the updater reports "no releases"
+# even when a newer version is published.
 import os as _os
-UPDATE_REPO = _os.environ.get("AKI_UPDATE_REPO", "AkiMelody/AkiMelody")
+UPDATE_REPO = _os.environ.get("AKI_UPDATE_REPO", "bobbyloo2018/AkiMelody")
 
 
 
