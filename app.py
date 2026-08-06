@@ -31,6 +31,16 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from ytmusicapi import YTMusic
 import ytmusic_auth as yauth
+# Cover Art Fetching Engine — async ISRC-first pipeline (artwork_fetcher.py).
+# Imported lazily so a missing httpx in a stripped-down dev env never breaks
+# Flask startup; the enrich route resolves it on first use.
+artwork_fetcher = None
+def _ensure_artwork_fetcher():
+    global artwork_fetcher
+    if artwork_fetcher is None:
+        import artwork_fetcher as _af
+        artwork_fetcher = _af
+    return artwork_fetcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("akimelody")
@@ -38,7 +48,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -2539,45 +2549,71 @@ def api_playlists_enrich_artwork():
         meta_files = sorted(f for f in pl_dir.iterdir() if f.name.endswith(".meta.json"))
         print(f"[ENRICH] Starting artwork enrichment for {safe_name}: {len(meta_files)} tracks", flush=True)
         enriched_count = 0
+
+        # Stage filter + shape — only tracks missing mzstatic.com iTunes art
+        # go through the ISRC-first pipeline; anything already resolved is
+        # left untouched so enrichment is idempotent across re-runs.
+        pending: list[tuple] = []  # (meta_path, meta_dict, art_before)
         for mf in meta_files:
             try:
                 meta = json.loads(mf.read_text(encoding="utf-8"))
-                # Skip if already has iTunes artwork
-                art = meta.get("art", "")
-                if art and "mzstatic.com" in art:
-                    continue
-                # Normalize for fetch_single_itunes_cover
-                track = {
-                    "name": meta.get("name", ""),
-                    "artist": meta.get("artist", ""),
-                    "title": meta.get("name", ""),
-                    "artist_name": meta.get("artist", ""),
-                    "art": art,
-                    "album_art": art,
-                    "dur": meta.get("dur", 0),
-                }
-                enriched = fetch_single_itunes_cover(track)
+            except Exception as e:
+                log.warning(f"Artwork enrichment read failed for {mf.name}: {e}")
+                continue
+            art = meta.get("art", "") or meta.get("album_art", "")
+            if art and "mzstatic.com" in art:
+                continue
+            pending.append((mf, meta, art))
+
+        if not pending:
+            print(f"[ENRICH] {safe_name}: nothing to do (all tracks already have iTunes art)", flush=True)
+            _invalidate_file_index()
+            _invalidate_playlist_cache()
+            return
+
+        # Build uniform batch payload for artwork_fetcher. Every track dict
+        # entering the pipeline carries the exact same key set — no deferrals
+        # to a separate codepath, no shape-sniffing inside the fetcher.
+        batch = []
+        for _mf, meta, _art in pending:
+            batch.append({
+                "name": meta.get("name", ""),
+                "artist": meta.get("artist", ""),
+                "art": meta.get("art", ""),
+                "album_art": meta.get("album_art", meta.get("art", "")),
+                "spotify_image_url": meta.get("spotify_image_url", ""),
+            })
+
+        af = _ensure_artwork_fetcher()
+        results = af.fetch_artwork_batch(batch)
+
+        # Persist results + download artwork files (sequential; cheap I/O).
+        for (mf, meta, art_before), enriched in zip(pending, results):
+            try:
                 new_art = enriched.get("art") or enriched.get("album_art", "")
-                if new_art and new_art != art:
-                    meta["art"] = new_art
-                    mf.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-                    # Download the artwork file
-                    tid = mf.stem.replace(".meta", "")
-                    art_path = pl_dir / f"{tid}.jpg"
-                    if not art_path.exists() and new_art.startswith(("https://", "http://")):
-                        try:
-                            r = requests.get(new_art, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                            if r.ok:
-                                art_path.write_bytes(r.content)
-                        except Exception:
-                            pass
-                    enriched_count += 1
-                    print(f"[ENRICH] {safe_name}: {meta.get('name', tid)} -> {new_art[:80]}", flush=True)
+                if not new_art or new_art == art_before:
+                    continue
+                meta["art"] = new_art
+                meta["album_art"] = new_art
+                if enriched.get("spotify_image_url"):
+                    meta["spotify_image_url"] = enriched["spotify_image_url"]
+                mf.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                tid = mf.stem.replace(".meta", "")
+                art_path = pl_dir / f"{tid}.jpg"
+                if not art_path.exists() and new_art.startswith(("https://", "http://")):
+                    try:
+                        r = requests.get(new_art, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                        if r.ok:
+                            art_path.write_bytes(r.content)
+                    except Exception:
+                        pass
+                enriched_count += 1
+                print(f"[ENRICH] {safe_name}: {meta.get('name', tid)} -> {new_art[:80]}", flush=True)
             except Exception as e:
                 log.warning(f"Artwork enrichment failed for {mf.name}: {e}")
         _invalidate_file_index()
         _invalidate_playlist_cache()
-        print(f"[ENRICH] Done for {safe_name}: {enriched_count}/{len(meta_files)} tracks updated", flush=True)
+        print(f"[ENRICH] Done for {safe_name}: {enriched_count}/{len(pending)} tracks updated", flush=True)
 
     _download_executor.submit(_enrich_worker)
     return jsonify({"success": True, "message": "Artwork enrichment started"})
