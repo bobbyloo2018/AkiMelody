@@ -5332,33 +5332,70 @@ def api_update_download():
 def api_update_launch():
     """Shell-execute the downloaded installer (silent mode) and signal the
     client to gracefully quit. Returns the launch method the frontend should
-    use (native bridge vs `window.open` fallback vs filesystem URL)."""
+    use (native bridge vs `window.open` fallback vs filesystem URL).
+
+    Foolproof flow mirroring webview_launcher.py's launch_installer: copy the
+    installer to %TEMP%, then spawn a DETACHED batch wrapper that POLLS for the
+    AkiMelody process to exit (up to ~60 s) — with `taskkill /F` as a fallback
+    before running the installer silently. This avoids the Windows "file in
+    use" dialog that Inno's `CloseApplications=yes` would otherwise pop on a
+    silent install, because the conflicting process is already gone by the
+    time the installer scans for it."""
     with _update_lock:
         path = _update_state.get("local_path") or ""
         status = _update_state.get("status")
     if status != "ready" or not path or not Path(path).exists():
         return jsonify({"ok": False, "error": "installer_not_ready"}), 409
 
-    # In packaged (pywebview) mode the native bridge performs a real
-    # ShellExecute + process-wide graceful quit. In web/Flask-standalone mode
-    # we fall back to the same timeout-buffer pattern the bridge uses: copy to
-    # %TEMP%, wait 2 s for the backend to release file locks, then run the
-    # installer with Inno Setup's /SILENT flag.
     try:
         import tempfile as _tf
         import shutil as _shutil
+        import datetime as _dt
         tmp_dir = _tf.gettempdir()
-        tmp_path = os.path.join(tmp_dir, "AkiMelody-Setup.exe")
+        tmp_installer = os.path.join(tmp_dir, "AkiMelody-Setup.exe")
         try:
-            _shutil.copy2(path, tmp_path)
+            _shutil.copy2(path, tmp_installer)
         except Exception:
-            tmp_path = path
-        cmd = (f'cmd.exe /c timeout /t 2 /nobreak && '
-               f'"{tmp_path}" /SILENT')
+            tmp_installer = path
+
+        # Generate the polling wrapper batch (same script the native bridge
+        # uses) and spawn it as a DETACHED process so it survives the Flask
+        # backend teardown.
+        bat_path = os.path.join(tmp_dir, "akimelody_update_flask.bat")
+        log_path = os.path.join(tmp_dir, "akimelody_update.log")
+        now = _dt.datetime.now().isoformat(timespec="seconds")
+        bat = (
+            "@echo off\r\n"
+            f"echo [{now}] flask update wrapper start >> \"{log_path}\"\r\n"
+            f"echo installer={tmp_installer} >> \"{log_path}\"\r\n"
+            "set /a tries=0\r\n"
+            ":wait_loop\r\n"
+            "set /a tries+=1\r\n"
+            "tasklist /FI \"IMAGENAME eq AkiMelody.exe\" 2>nul | find /I \"AkiMelody.exe\" >nul\r\n"
+            "if errorlevel 1 goto gone\r\n"
+            "if %tries% GEQ 60 goto force_kill\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            "goto wait_loop\r\n"
+            ":force_kill\r\n"
+            f"echo [{now}] process still alive — taskkill /F >> \"{log_path}\"\r\n"
+            "taskkill /F /IM AkiMelody.exe >nul 2>&1\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            ":gone\r\n"
+            f"echo [{now}] process gone — running installer >> \"{log_path}\"\r\n"
+            f'"{tmp_installer}" /SILENT /NORESTART >> "{log_path}" 2>&1\r\n'
+            f"echo [{now}] installer exit code %ERRORLEVEL% >> \"{log_path}\"\r\n"
+            "(start /b \"\" cmd /c \"timeout /t 2 /nobreak >nul & del \"%~f0\"\")\r\n"
+        )
+        try:
+            with open(bat_path, "w", encoding="ascii", errors="replace") as fh:
+                fh.write(bat)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"wrapper_write_failed: {e}"}), 500
+
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         proc = subprocess.Popen(
-            cmd,
+            f'cmd.exe /c "{bat_path}"',
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
             shell=False,
@@ -5366,8 +5403,9 @@ def api_update_launch():
         return jsonify({
             "ok": True,
             "method": "shell_execute",
-            "local_path": tmp_path,
+            "local_path": tmp_installer,
             "pid": proc.pid,
+            "wrapper": bat_path,
         })
     except Exception as e:
         # Fallback: reveal the file so the user can double-click it.
