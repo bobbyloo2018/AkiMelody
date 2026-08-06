@@ -1,0 +1,334 @@
+[
+  {
+    "id": "pl_1785868579490",
+    "name": "┌( ・-・ )┘",
+    "description": "Shared from AkiMelody",
+    "author": "bobbyloo2018",
+    "avatarUrl": "https://avatars.githubusercontent.com/u/42017803?v=4",
+    "tracks": [
+      {
+        "name": "Sweet Talk",
+        "artist": "Saint Motel",
+        "tid": "00000000000000000000000029975d57",
+        "dur": 192,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/63/2d/c7/632dc719-fd73-225c-e15a-23aaa5e07e9d/075679915313.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "this is what autumn feels like",
+        "artist": "JVKE",
+        "tid": "00000000000000000000000065c712e7",
+        "dur": 220,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music116/v4/24/ec/59/24ec5968-5ed9-23a6-85d5-c892c7250a8a/197189899157.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Superstition - Single Version",
+        "artist": "Stevie Wonder",
+        "tid": "00000000000000000000000065ac7160",
+        "dur": 245,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/62/61/61/626161c0-f4d7-e6ff-8586-768340ef278f/00602537002382.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Ophelia",
+        "artist": "The Lumineers",
+        "tid": "0000000000000000000000001301a842",
+        "dur": 160,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/0c/46/21/0c462181-5777-67a5-ec92-1775e9a3d5d4/22999.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "American Money",
+        "artist": "BØRNS",
+        "tid": "0000000000000000000000003979b71e",
+        "dur": 261,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music125/v4/07/37/8e/07378ef3-7950-ba76-4280-9acb0e5d032a/15UMGIM42534.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Mind Is A Prison",
+        "artist": "Alec Benjamin",
+        "tid": "000000000000000000000000599e2c5a",
+        "dur": 162,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music123/v4/0b/92/e9/0b92e992-787f-ad5d-198a-16a8605c99f7/075679823458.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Feel It Still",
+        "artist": "Portugal. The Man",
+        "tid": "0000000000000000000000000a753aa9",
+        "dur": 163,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/76/fc/2d/76fc2dba-69ea-2718-012d-962dcb661bf1/075679896933.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Wow, I'm Not Crazy",
+        "artist": "AJR",
+        "tid": "0000000000000000000000002a98c956",
+        "dur": 197,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/d4/10/64/d410641c-73b3-96ed-d63a-4f9ba2074a5f/4050538475708.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Stressed Out",
+        "artist": "Twenty One Pilots",
+        "tid": "00000000000000000000000000056f86",
+        "dur": 202,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/8e/e2/89/8ee28904-0821-610d-5011-a61845f62756/075679926951.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Pumped Up Kicks",
+        "artist": "Foster The People",
+        "tid": "0000000000000000000000007ff09ed7",
+        "dur": 240,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/ba/07/5b/ba075b3c-f0c4-b519-59f3-7ae74d43246b/dj.lajxsvkg.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Little Lion Man",
+        "artist": "Mumford & Sons",
+        "tid": "0000000000000000000000005d8a9426",
+        "dur": 247,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/5d/dd/77/5ddd77b5-0331-5ce2-ac33-901e3aad85bd/0044003151451_Cover.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Feel Good Inc.",
+        "artist": "Gorillaz, De La Soul",
+        "tid": "0000000000000000000000005c5ee9af",
+        "dur": 223,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music125/v4/1c/0f/81/1c0f818a-e458-dd84-6f1b-ccbdf5fe14d6/825646291045.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Somebody That I Used To Know",
+        "artist": "Gotye, Kimbra",
+        "tid": "0000000000000000000000004c88abbe",
+        "dur": 245,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/b3/8a/98/b38a9867-2a9c-de2f-2d80-c624fb2200ec/11UMGIM19347.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Time - Edit",
+        "artist": "NF",
+        "tid": "00000000000000000000000055ee0987",
+        "dur": 231,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/3e/fe/fa/3efefa81-fa46-8124-46b1-1b340baff0e9/19UMGIM46307.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Ain't No Rest for the Wicked",
+        "artist": "Cage The Elephant",
+        "tid": "00000000000000000000000015dde722",
+        "dur": 175,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/9f/da/28/9fda2801-af49-b8d6-4b1f-0671af204dfb/886447357378.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "The End.",
+        "artist": "My Chemical Romance",
+        "tid": "0000000000000000000000002707c9b8",
+        "dur": 113,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/56/99/8a/56998a1c-efe7-fdf0-2b1d-e2da88d8df52/093624917724.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "My Girl",
+        "artist": "The Temptations",
+        "tid": "0000000000000000000000002c4dfc60",
+        "dur": 164,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music123/v4/84/2d/f1/842df19d-e5f4-3b9f-9405-6779bbc43fe0/06UMGIM07353.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Without Me",
+        "artist": "Eminem",
+        "tid": "00000000000000000000000021eb639c",
+        "dur": 290,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music118/v4/dd/5c/e6/dd5ce621-f7d2-f767-7a08-e7a7eaa7870b/00602537526994.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "God Only Knows",
+        "artist": "The Beach Boys",
+        "tid": "0000000000000000000000004639e106",
+        "dur": 175,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music116/v4/d4/22/97/d422973f-c3ff-0600-2b6b-a22f7c0cf0f9/16UMGIM17479.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Hey There Delilah",
+        "artist": "Plain White T's",
+        "tid": "0000000000000000000000002e6fdf97",
+        "dur": 233,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/2f/1a/e9/2f1ae9ea-2b85-c4dc-f14f-1eaf446076df/20CRGIM21731.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Why Don't You Get A Job",
+        "artist": "The Offspring",
+        "tid": "0000000000000000000000001265d6b9",
+        "dur": 172,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music125/v4/74/79/7b/74797b37-ea15-e667-1e75-8f59053e41f3/00602557270945.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Ho Hey",
+        "artist": "The Lumineers",
+        "tid": "0000000000000000000000005865bd21",
+        "dur": 163,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/83/20/a9/8320a945-11ac-e7cd-29e7-d80782698f55/18515.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Jessie's Girl",
+        "artist": "Rick Springfield",
+        "tid": "00000000000000000000000063fae92e",
+        "dur": 194,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music113/v4/52/1e/e8/521ee88b-8fcc-0d53-345d-3b82d910a554/828768486726.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Fight For Your Right",
+        "artist": "Beastie Boys",
+        "tid": "000000000000000000000000700b3fab",
+        "dur": 209,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/e4/d7/81/e4d781e8-bd3f-486a-cd18-e9b3a7d12b34/00731452735126.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Take Me To Your Leader",
+        "artist": "Newsboys",
+        "tid": "00000000000000000000000004c84739",
+        "dur": 178,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/86/bf/17/86bf17b0-def1-8358-cf3a-879870136188/00724382007555.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "My Type",
+        "artist": "Saint Motel",
+        "tid": "0000000000000000000000001eb443a9",
+        "dur": 205,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/f3/83/43/f38343e2-5750-c2c1-891f-18507bd559c3/825646264025.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Banana Pancakes",
+        "artist": "Jack Johnson",
+        "tid": "0000000000000000000000005e599934",
+        "dur": 192,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/44/06/fd/4406fdc0-aab5-e300-82ba-3e5fe81a68a7/00602537868858.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Creep",
+        "artist": "Radiohead",
+        "tid": "00000000000000000000000008e94a9d",
+        "dur": 239,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/28/7a/7c/287a7ca9-ed95-1a21-e3bb-4559a1a0ac0e/191404134351.png/600x600bb.jpg"
+      },
+      {
+        "name": "Trap Anthem",
+        "artist": "MC Virgins, Yun Head",
+        "tid": "000000000000000000000000798921e1",
+        "dur": 133,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/e8/8b/77/e88b77b1-d1f5-e0e9-271c-2b0bad9edb45/0.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Rude",
+        "artist": "MAGIC!",
+        "tid": "0000000000000000000000003af1e6af",
+        "dur": 225,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/2a/46/74/2a4674c2-889f-4f6b-e4e9-b3693f8ee962/886444607650.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Crazy",
+        "artist": "Gnarls Barkley",
+        "tid": "00000000000000000000000032bf1595",
+        "dur": 182,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/fc/6e/1e/fc6e1e95-7f93-09d8-455e-2f24a537a71f/603497823703.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Honey, I'm Good",
+        "artist": "Andy Grammer",
+        "tid": "000000000000000000000000501bb2a7",
+        "dur": 199,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/58/fc/72/58fc726b-bd24-b38e-f52b-3b7d42514e29/0807315161057.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Safe And Sound",
+        "artist": "Capital Cities",
+        "tid": "0000000000000000000000004813e1f3",
+        "dur": 193,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/d1/a1/54/d1a1545c-7fc7-1262-d65a-f7a9b0a3a5ca/602537370351_cover.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Mama Said",
+        "artist": "Lukas Graham",
+        "tid": "0000000000000000000000000aab4488",
+        "dur": 207,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music69/v4/1f/57/08/1f57082e-ee7e-dcb7-a73e-ba1f3468211d/093624920496.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "surviving on defiance",
+        "artist": "Poppy",
+        "tid": "0000000000000000000000005cb08922",
+        "dur": 208,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/39/b3/ff/39b3ff43-df24-345e-a444-71414fb63b23/198704125270_Cover.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Forget You",
+        "artist": "CeeLo Green",
+        "tid": "000000000000000000000000059cd0ea",
+        "dur": 223,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music/7d/10/55/mzi.unbzhech.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Parallel Parking",
+        "artist": "Arden Jones",
+        "tid": "00000000000000000000000066367db3",
+        "dur": 119,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/96/b3/a2/96b3a27a-7bbd-413e-e000-86d9990cad36/075679756428.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "I Think I Like When It Rains",
+        "artist": "WILLIS",
+        "tid": "000000000000000000000000717b7518",
+        "dur": 278,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/6f/fe/e5/6ffee579-edef-b4c3-48eb-fa5cad0591ee/888295606905_willis.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Goo",
+        "artist": "Em Beihold",
+        "tid": "00000000000000000000000052a83985",
+        "dur": 176,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/67/f4/53/67f453e0-baa3-bea4-1344-881050fe9cf1/22UMGIM73329.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "You Give A Little Love - From \"Bugsy Malone\" Original Motion Picture Soundtrack",
+        "artist": "Paul Williams",
+        "tid": "0000000000000000000000000037c65c",
+        "dur": 234,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music128/v4/3e/4f/91/3e4f910a-ee72-caeb-e62e-7085863b1053/00042283154025.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Put Your Head On My Shoulder - Remastered",
+        "artist": "Paul Anka",
+        "tid": "0000000000000000000000006f011b0c",
+        "dur": 159,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music123/v4/05/bb/63/05bb63e3-0bfe-23bb-3b95-2b00577a3b30/22UM1IM43112.rgb.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Build Me Up Buttercup - Mono",
+        "artist": "The Foundations",
+        "tid": "0000000000000000000000004c4693e7",
+        "dur": 180,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/fa/82/22/fa82229b-ce97-0a4f-bc9f-ccc29e3fc88b/741869398029.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Locked out of Heaven",
+        "artist": "Bruno Mars",
+        "tid": "0000000000000000000000005639ec92",
+        "dur": 233,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e0/a4/7c/e0a47c6f-005a-9f9f-ce29-8e858e2bcfcb/075679957283.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Fear of Dying",
+        "artist": "Poppy",
+        "tid": "00000000000000000000000050402f51",
+        "dur": 163,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/24/b9/99/24b999d2-720c-2e71-a14a-76dda7ce63c8/00810016764496_Cover.jpg/600x600bb.jpg"
+      },
+      {
+        "name": "Kumquat",
+        "artist": "Token",
+        "tid": "0000000000000000000000002f5e0994",
+        "dur": 175,
+        "art": ""
+      },
+      {
+        "name": "Someone New",
+        "artist": "Hozier",
+        "tid": "0000000000000000000000000f887af0",
+        "dur": 223,
+        "art": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/5e/1b/f1/5e1bf1de-e5f1-e73e-0752-e7882b4f2d57/886444718820.jpg/600x600bb.jpg"
+      }
+    ],
+    "publishedAt": 1785868579
+  }
+]

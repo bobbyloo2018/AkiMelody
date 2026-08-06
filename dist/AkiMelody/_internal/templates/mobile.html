@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>AkiMelody Mobile</title>
+    <link rel="stylesheet" href="/static/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/mobile.css">
+</head>
+<body>
+    <div class="mobile-blur-bg" id="mobile-bg-artwork"></div>
+
+    <div class="app-viewport">
+        <!-- 1. Player View -->
+        <section id="view-player" class="mobile-view active">
+            <header class="player-header">
+                <h1>AkiMelody</h1>
+                <span class="brand-sub">秋メロディ</span>
+            </header>
+
+            <div class="artwork-container">
+                <img id="m-art" src="" alt="" decoding="async">
+                <div id="m-ph" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:80px;color:rgba(255,255,255,0.1);"><i class="fa-solid fa-music"></i></div>
+            </div>
+
+            <div class="track-meta">
+                <h2 id="m-title">Not Playing</h2>
+                <p id="m-artist">AkiMelody</p>
+            </div>
+
+                <div class="player-timeline">
+                    <input type="range" class="slider-track" id="m-progress" value="0" min="0" max="100" oninput="mSeek(this.value)">
+                    <div class="time-row">
+                        <span id="m-time-cur">0:00</span>
+                        <span id="m-time-total">0:00</span>
+                    </div>
+                </div>
+
+            <div class="player-controls">
+                <button class="btn-ctrl" onclick="mToggleShuffle()" id="m-shuffle-btn"><i class="fa-solid fa-shuffle"></i></button>
+                <button class="btn-ctrl" onclick="mPrev(true)"><i class="fa-solid fa-backward-step"></i></button>
+                <button class="btn-play-main" onclick="mTogglePlay()"><i class="fa-solid fa-play" id="m-play-icon"></i></button>
+                <button class="btn-ctrl" onclick="mNext(true)"><i class="fa-solid fa-forward-step"></i></button>
+                <button class="btn-ctrl" onclick="mToggleRepeat()" id="m-repeat-btn"><i class="fa-solid fa-repeat"></i></button>
+                <button class="btn-ctrl" onclick="mToggleRadio()" id="m-radio-btn"><i class="fa-solid fa-tower-broadcast"></i></button>
+                <button class="btn-ctrl" onclick="mHandleLike()" id="m-like-btn"><i class="fa-solid fa-heart"></i></button>
+            </div>
+        </section>
+
+        <!-- 2. Search View -->
+        <section id="view-search" class="mobile-view">
+            <header class="view-header">
+                <h3>Discovery</h3>
+            </header>
+            <form class="search-box" onsubmit="mHandleSearch(); return false;">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <input type="search" id="m-search-input" placeholder="Search for music..." enterkeyhint="search">
+                <select id="m-search-filter" style="background:none; border:none; color:var(--text-dim); font-size:12px; font-weight:700; outline:none;">
+                    <option value="all">All</option>
+                    <option value="track">Tracks</option>
+                    <option value="album">Albums</option>
+                    <option value="artist">Artists</option>
+                </select>
+            </form>
+            <div class="results-list" id="m-search-results">
+                <!-- Search items injected here -->
+            </div>
+        </section>
+
+        <!-- 3. Library View -->
+        <section id="view-library" class="mobile-view">
+            <header class="view-header" style="display:flex; justify-content:space-between; align-items:center;">
+                <h3>Library</h3>
+                <button class="btn-ctrl" onclick="mToggleSettings()"><i class="fa-solid fa-gear"></i></button>
+            </header>
+            <div class="results-list" id="m-library-list">
+                <!-- Library/Queue items injected here -->
+            </div>
+        </section>
+
+        <!-- Persistent Bottom Nav -->
+        <nav class="bottom-nav">
+            <button class="nav-item active" onclick="mSwitchView('player')" id="nav-player">
+                <i class="fa-solid fa-compact-disc"></i>
+                <span>Player</span>
+            </button>
+            <button class="nav-item" onclick="mSwitchView('search')" id="nav-search">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <span>Search</span>
+            </button>
+            <button class="nav-item" onclick="mSwitchView('library')" id="nav-library">
+                <i class="fa-solid fa-list-ul"></i>
+                <span>Library</span>
+            </button>
+        </nav>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="modal-settings">
+        <header class="settings-header">
+            <h2 style="margin:0;">Settings</h2>
+            <button class="btn-ctrl" onclick="mToggleSettings()"><i class="fa-solid fa-xmark"></i></button>
+        </header>
+        
+        <div class="settings-row">
+            <span>Theme Mode</span>
+            <div class="toggle-switch" id="toggle-theme" onclick="mToggleTheme()">
+                <div class="toggle-knob"></div>
+            </div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:-5px; margin-bottom:15px;">
+            <span id="themeLabelDark" style="font-size:11px; font-weight:700; color:var(--accent);">Dark</span>
+            <span id="themeLabelLight" style="font-size:11px; font-weight:700; color:var(--text-dim);">Light</span>
+        </div>
+        
+        <div class="settings-row">
+            <span>Layout Mode</span>
+            <div class="toggle-switch" id="toggle-layout" onclick="mToggleLayout()">
+                <div class="toggle-knob"></div>
+            </div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:-5px; margin-bottom:15px;">
+            <span id="layoutLabelList" style="font-size:11px; font-weight:700; color:var(--text-dim);">List</span>
+            <span id="layoutLabelCard" style="font-size:11px; font-weight:700; color:var(--accent);">Card</span>
+        </div>
+
+        <div class="settings-row">
+            <span>Fullscreen Mode</span>
+            <div class="toggle-switch" id="toggle-fullscreen" onclick="mToggleFullscreen()">
+                <div class="toggle-knob"></div>
+            </div>
+        </div>
+        
+        <div style="margin-top:auto; text-align:center; opacity:0.3; font-size:12px;">
+            AkiMelody Mobile v2.0
+        </div>
+    </div>
+
+    <div id="notification-toast"></div>
+    <audio id="akiAudio" preload="none"></audio>
+
+    <script src="/static/js/mobile.js"></script>
+</body>
+</html>

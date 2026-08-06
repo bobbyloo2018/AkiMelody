@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AkiMelody</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #08040d; color: #ccc; font-family: 'Segoe UI', sans-serif;
+         display: flex; align-items: center; justify-content: center; height: 100vh; }
+  .loader { text-align: center; max-width: 440px; padding: 0 20px; }
+  .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1);
+             border-top-color: #ff6b9d; border-radius: 50%;
+             animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #status { margin-top: 8px; font-size: 13px; color: #666; }
+  #timer { font-variant-numeric: tabular-nums; }
+  #phase { font-size: 11px; color: #555; margin-top: 4px; }
+  #error { display: none; margin-top: 16px; }
+  #error span { color: #ff6b6b; font-weight: 700; }
+  #error small { color: #9aa0a6; font-size: 11px; display: block; margin-top: 8px;
+                 max-height: 160px; overflow-y: auto; white-space: pre-wrap;
+                 word-break: break-all; text-align: left; background: rgba(255,255,255,0.03);
+                 padding: 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); }
+  #retryBtn { display: none; margin-top: 16px; padding: 10px 28px; border: none;
+              border-radius: 8px; background: #ff6b9d; color: #fff; font-weight: 700;
+              font-size: 13px; cursor: pointer; transition: opacity 0.2s; }
+  #retryBtn:hover { opacity: 0.85; }
+</style>
+</head>
+<body>
+<div class="loader">
+  <div class="spinner" id="spinner"></div>
+  <div id="label">Starting server...</div>
+  <div id="status">Elapsed: <span id="timer">0.0</span>s</div>
+  <div id="phase">Waiting for backend process to start</div>
+  <div id="error"><span id="errorTitle">Server failed to start</span><small id="errorDetail"></small></div>
+  <button id="retryBtn" onclick="location.reload()">Retry</button>
+</div>
+<script>
+  var t0 = Date.now();
+  var timerEl = document.getElementById('timer');
+  var phaseEl = document.getElementById('phase');
+  var labelEl = document.getElementById('label');
+  var errorEl = document.getElementById('error');
+  var detailEl = document.getElementById('errorDetail');
+  var titleEl = document.getElementById('errorTitle');
+  var spinnerEl = document.getElementById('spinner');
+  var retryBtn = document.getElementById('retryBtn');
+  var failed = false;
+
+  function updateTimer() {
+    if (!failed) {
+      var s = ((Date.now() - t0) / 1000).toFixed(1);
+      timerEl.textContent = s;
+      // Update phase hint based on elapsed time
+      var sec = parseFloat(s);
+      if (sec > 5 && sec <= 15) phaseEl.textContent = 'Extracting runtime (first launch may be slow)...';
+      else if (sec > 15 && sec <= 30) phaseEl.textContent = 'Loading Python modules...';
+      else if (sec > 30) phaseEl.textContent = 'Server is taking unusually long to start';
+      requestAnimationFrame(updateTimer);
+    }
+  }
+  requestAnimationFrame(updateTimer);
+
+  // Called by main.rs when the TCP poll times out
+  window._showServerError = function(msg) {
+    failed = true;
+    spinnerEl.style.animationPlayState = 'paused';
+    spinnerEl.style.borderColor = 'rgba(255,107,107,0.3)';
+    spinnerEl.style.borderTopColor = '#ff6b6b';
+    labelEl.textContent = 'Startup failed';
+    phaseEl.textContent = '';
+    errorEl.style.display = 'block';
+    detailEl.textContent = msg || 'The backend process exited unexpectedly.\nCheck akimelody-sidecar.log for details.';
+    retryBtn.style.display = 'inline-block';
+  };
+
+  // JS polling fallback — navigates only after 3 consecutive successful checks
+  // to prevent navigating away during a brief port-open-then-crash scenario
+  var OK_STREAK = 3;
+  var streak = 0;
+  async function poll() {
+    for (var i = 0; i < 600; i++) {
+      try {
+        var r = await fetch('http://localhost:5000/', { mode: 'no-cors' });
+        streak++;
+        phaseEl.textContent = 'Server responding... (' + streak + '/' + OK_STREAK + ')';
+        if (streak >= OK_STREAK) {
+          window.location.href = 'http://localhost:5000/';
+          return;
+        }
+      } catch(e) {
+        streak = 0;
+        phaseEl.textContent = 'Waiting for backend process to start';
+      }
+      await new Promise(function(r) { setTimeout(r, 1000); });
+    }
+    _showServerError('Server did not respond within 10 minutes.\nPort 5000 may be blocked by another process.');
+  }
+  poll();
+</script>
+</body>
+</html>

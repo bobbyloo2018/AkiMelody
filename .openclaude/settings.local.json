@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \":*)",
+      "Bash(python3 -c \":*)",
+      "Bash(node -e \"const fs=require\\(''fs''\\);const html=fs.readFileSync\\(''templates/player.html'',''utf8''\\);const s=html.indexOf\\(''<script>''\\)+8;const e=html.lastIndexOf\\(''</script>''\\);const js=html.substring\\(s,e\\);fs.writeFileSync\\(''t.js'',js\\);console.log\\(''len:'',js.length\\);\")",
+      "Bash(node:*)",
+      "Bash(cargo check:*)",
+      "Bash(awk:*)",
+      "Bash(cd:*)",
+      "Bash(python -c \"import app; print\\(''app.py syntax OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app.py''\\).read\\(\\)\\); print\\(''app.py syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app.py'',''rb''\\).read\\(\\)\\); print\\(''app.py syntax OK''\\)\")",
+      "Bash(mv temp_script.js temp_script.js.off)",
+      "Bash(ls -la temp_script*)",
+      "Bash(for cut:*)",
+      "Bash(do head:*)",
+      "Bash(printf '%4d: ' $cut)",
+      "Bash(done)",
+      "Bash(sed -n '3533,3540p' /tmp/ps.js)",
+      "Bash(rm -f _ps.js)",
+      "Bash(sed -n '3533,10408p' templates/player.html)",
+      "Bash(printf /*end*/)",
+      "Bash(rm -f _t.js)",
+      "Bash(sed -n '1,9774p' _ps.js)",
+      "Bash(sed -n '9770p' _ps.js)",
+      "Bash(sed -n 1,6200p _ps.js)",
+      "Bash(ls \"C:/Users/gninj/Downloads/Aki\"/_*.js)"
+    ]
+  }
+}
