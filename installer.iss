@@ -10,12 +10,12 @@
 ;  Silent installs (/SILENT /VERYSILENT) auto-relaunch AkiMelody afterward.
 ; ============================================================================
 
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 
 [Setup]
 ; App identity — change AppId per major version to allow side-by-side installs.
 AppId={{AkiMelody-2026-08-05-r1}
-AppVersion=1.0.0
+AppVersion=1.0.1
 AppVerName=AkiMelody {#MyAppVersion}
 AppName=AkiMelody
 AppPublisher=AkiMelody
