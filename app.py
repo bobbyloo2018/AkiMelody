@@ -5371,12 +5371,17 @@ def api_update_launch():
     use (native bridge vs `window.open` fallback vs filesystem URL).
 
     Foolproof flow mirroring webview_launcher.py's launch_installer: copy the
-    installer to %TEMP%, then spawn a DETACHED batch wrapper that POLLS for the
-    AkiMelody process to exit (up to ~60 s) — with `taskkill /F` as a fallback
-    before running the installer silently. This avoids the Windows "file in
-    use" dialog that Inno's `CloseApplications=yes` would otherwise pop on a
-    silent install, because the conflicting process is already gone by the
-    time the installer scans for it."""
+    installer to %TEMP%, then spawn a DETACHED batch wrapper that waits a
+    short fixed grace period (3 s) before running the installer silently with
+    /SILENT /CLOSEAPPLICATIONS /NORESTART. The grace window covers our own
+    teardown; Inno's `CloseApplications=yes` (installer.iss) then handles any
+    straggler AkiMelody.exe during install.
+
+    We do NOT poll `tasklist | find /I "AkiMelody.exe"` for the process to
+    vanish: that loops forever when the app is running as `python.exe` (via
+    Launch.bat from source), since the visible name is `python.exe`, not
+    `AkiMelody.exe`. The name-poll was the bug behind the cmd window stuck
+    on `find /I "AkiMelody.exe"` doing nothing."""
     with _update_lock:
         path = _update_state.get("local_path") or ""
         status = _update_state.get("status")
@@ -5394,9 +5399,7 @@ def api_update_launch():
         except Exception:
             tmp_installer = path
 
-        # Generate the polling wrapper batch (same script the native bridge
-        # uses) and spawn it as a DETACHED process so it survives the Flask
-        # backend teardown.
+        # Generate the wrapper batch (mirrors the native bridge's wrapper).
         bat_path = os.path.join(tmp_dir, "akimelody_update_flask.bat")
         log_path = os.path.join(tmp_dir, "akimelody_update.log")
         now = _dt.datetime.now().isoformat(timespec="seconds")
@@ -5404,21 +5407,10 @@ def api_update_launch():
             "@echo off\r\n"
             f"echo [{now}] flask update wrapper start >> \"{log_path}\"\r\n"
             f"echo installer={tmp_installer} >> \"{log_path}\"\r\n"
-            "set /a tries=0\r\n"
-            ":wait_loop\r\n"
-            "set /a tries+=1\r\n"
-            "tasklist /FI \"IMAGENAME eq AkiMelody.exe\" 2>nul | find /I \"AkiMelody.exe\" >nul\r\n"
-            "if errorlevel 1 goto gone\r\n"
-            "if %tries% GEQ 60 goto force_kill\r\n"
-            "timeout /t 1 /nobreak >nul\r\n"
-            "goto wait_loop\r\n"
-            ":force_kill\r\n"
-            f"echo [{now}] process still alive — taskkill /F >> \"{log_path}\"\r\n"
-            "taskkill /F /IM AkiMelody.exe >nul 2>&1\r\n"
-            "timeout /t 1 /nobreak >nul\r\n"
-            ":gone\r\n"
-            f"echo [{now}] process gone — running installer >> \"{log_path}\"\r\n"
-            f'"{tmp_installer}" /SILENT /NORESTART >> "{log_path}" 2>&1\r\n'
+            f"echo [{now}] grace wait 3s before install >> \"{log_path}\"\r\n"
+            "timeout /t 3 /nobreak >nul\r\n"
+            f"echo [{now}] running installer >> \"{log_path}\"\r\n"
+            f'"{tmp_installer}" /SILENT /CLOSEAPPLICATIONS /NORESTART >> "{log_path}" 2>&1\r\n'
             f"echo [{now}] installer exit code %ERRORLEVEL% >> \"{log_path}\"\r\n"
             "(start /b \"\" cmd /c \"timeout /t 2 /nobreak >nul & del \"%~f0\"\")\r\n"
         )
