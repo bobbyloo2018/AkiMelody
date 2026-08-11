@@ -31,6 +31,15 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from ytmusicapi import YTMusic
 import ytmusic_auth as yauth
+from data_paths import prepare_data_paths, resolve_bundled_tool
+from security_utils import (
+    UPDATE_MAX_BYTES,
+    env_flag,
+    is_allowed_update_url,
+    is_loopback_address,
+    is_trusted_installer,
+    safe_filename_component,
+)
 # Cover Art Fetching Engine — async ISRC-first pipeline (artwork_fetcher.py).
 # Imported lazily so a missing httpx in a stripped-down dev env never breaks
 # Flask startup; the enrich route resolves it on first use.
@@ -48,7 +57,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -95,28 +104,105 @@ def _is_private_or_link_local(url):
 
 # ── App & Directories ────────────────────────────────────────────────────────
 import sys as _sys
-if getattr(_sys, "frozen", False):
-    # PyInstaller one-file: templates/static are extracted to sys._MEIPASS.
-    _meipass = Path(getattr(_sys, "_MEIPASS", Path(_sys.executable).parent))
-    app = Flask(__name__,
-                template_folder=str(_meipass / "templates"),
-                static_folder=str(_meipass / "static"))
-    _data = Path(os.environ.get("LOCALAPPDATA", str(Path(_sys.executable).parent))) / "AkiMelody"
-    _data.mkdir(parents=True, exist_ok=True)
-    BASE_DIR = _data
-else:
-    app = Flask(__name__)
-    BASE_DIR = Path(__file__).parent
+DATA_PATHS, _DATA_MIGRATION = prepare_data_paths(__file__)
+RESOURCE_DIR = DATA_PATHS.resources
+# BASE_DIR remains as a compatibility alias for code that reports paths
+# relative to the mutable data root.
+BASE_DIR = DATA_PATHS.root
+app = Flask(
+    __name__,
+    template_folder=str(RESOURCE_DIR / "templates"),
+    static_folder=str(RESOURCE_DIR / "static"),
+)
+if _DATA_MIGRATION.get("copied"):
+    log.info(
+        "Migrated %s legacy data files into %s (originals retained)",
+        _DATA_MIGRATION["copied"],
+        BASE_DIR,
+    )
 SERVER_PORT = int(os.environ.get("AKI_SERVER_PORT", "5000"))
+LAN_ACCESS_ENABLED = env_flag("AKI_ALLOW_LAN")
+LAN_ACCESS_TOKEN = os.environ.get("AKI_LAN_TOKEN", "").strip()
+LAN_ACCESS_COOKIE = "aki_lan_access"
+SERVER_BIND_HOST = "0.0.0.0" if LAN_ACCESS_ENABLED else "127.0.0.1"
+if LAN_ACCESS_ENABLED and len(LAN_ACCESS_TOKEN) < 20:
+    raise RuntimeError(
+        "AKI_ALLOW_LAN requires AKI_LAN_TOKEN with at least 20 characters. "
+        "Leave AKI_ALLOW_LAN unset for private localhost-only mode."
+    )
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request body
-SAVED_DIR = BASE_DIR / "SAVED"
+
+
+@app.before_request
+def _protect_local_service():
+    """Keep LAN access authenticated and reject browser cross-site writes."""
+    remote_is_local = is_loopback_address(request.remote_addr)
+
+    if LAN_ACCESS_ENABLED and not remote_is_local:
+        supplied = request.headers.get("X-Aki-Token", "") or request.cookies.get(LAN_ACCESS_COOKIE, "")
+        query_token = request.args.get("token", "")
+
+        # A one-time URL is convenient on phones; immediately replace it with
+        # an HttpOnly, same-site cookie and remove the secret from the address.
+        if request.method == "GET" and request.path in {"/", "/mobile"} and query_token:
+            if secrets.compare_digest(query_token, LAN_ACCESS_TOKEN):
+                query = [
+                    (key, value)
+                    for key in request.args
+                    if key != "token"
+                    for value in request.args.getlist(key)
+                ]
+                target = request.path
+                if query:
+                    target += "?" + urllib.parse.urlencode(query)
+                response = _flask_redirect(target)
+                response.set_cookie(
+                    LAN_ACCESS_COOKIE,
+                    LAN_ACCESS_TOKEN,
+                    max_age=30 * 24 * 60 * 60,
+                    httponly=True,
+                    samesite="Strict",
+                    secure=request.is_secure,
+                )
+                response.headers["Cache-Control"] = "no-store"
+                return response
+        if not supplied or not secrets.compare_digest(supplied, LAN_ACCESS_TOKEN):
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "lan_auth_required"}), 401
+            return Response("AkiMelody LAN access token required.", status=401, mimetype="text/plain")
+
+    # CORS does not prevent every cross-site form submission. When a browser
+    # supplies Origin for a write, require it to match this exact app origin.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlparse(origin)
+                same_origin = parsed.scheme in {"http", "https"} and parsed.netloc.lower() == request.host.lower()
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                return jsonify({"ok": False, "error": "cross_origin_request_blocked"}), 403
+
+
+@app.after_request
+def _no_store_word_sync(resp):
+    # The Word Sync addon/fetcher are under active development; never let a
+    # persistent browser/WebView2 cache serve stale copies.
+    if request.path.startswith("/static/js/word-"):
+        resp.headers["Cache-Control"] = "no-store"
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
+
+SAVED_DIR = DATA_PATHS.saved
 SAVED_DIR.mkdir(exist_ok=True)
 FAVORITES_JSON = BASE_DIR / "favorites.json"
 
-MUSIC_LIBRARY_DIR = BASE_DIR / "music_library"
-PLAYLISTS_DIR = MUSIC_LIBRARY_DIR / "playlists"
+MUSIC_LIBRARY_DIR = DATA_PATHS.music_library
+PLAYLISTS_DIR = DATA_PATHS.playlists
 PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
-LYRICS_DIR = MUSIC_LIBRARY_DIR / "lyrics"
+LYRICS_DIR = DATA_PATHS.lyrics
 LYRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 _STREAM_CACHE_MAX = 100
@@ -247,6 +333,18 @@ def _save_stats_locked(data):
     tmp = STATS_JSON.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, STATS_JSON)
+
+
+def _atomic_write_json(path, data):
+    """Write *data* as JSON to *path* atomically (temp-file + os.replace).
+
+    If the target is ``favorites.json`` or ``settings.json``, a crash or power
+    loss mid-write can no longer leave a truncated file; the reader will always
+    see the previous complete version until the ``os.replace`` completes.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _ts_to_day(ts):
@@ -665,15 +763,15 @@ def _ydl_js_runtimes() -> dict:
              is resolved from sys._MEIPASS — no Node required on user machines.
     """
     runtimes = {}
-    qjs = None
-    if getattr(_sys, "frozen", False):
-        cand = Path(getattr(_sys, "_MEIPASS", Path(_sys.executable).parent)) / "qjs.exe"
-        if cand.exists():
-            qjs = str(cand)
-    else:
-        found = shutil.which("qjs") or shutil.which("qjs.exe")
-        if found:
-            qjs = found
+    # build.py installs QuickJS at <resources>/build/qjs.exe in packaged mode;
+    # the same path exists in the source checkout. Older bundles placed it at
+    # the resource root, so retain that fallback before checking PATH.
+    qjs_path = resolve_bundled_tool(
+        RESOURCE_DIR,
+        (Path("build") / "qjs.exe", Path("qjs.exe")),
+        ("qjs", "qjs.exe"),
+    )
+    qjs = str(qjs_path) if qjs_path else None
     if qjs:
         runtimes["quickjs"] = {"path": qjs}
     if shutil.which("node"):
@@ -695,6 +793,10 @@ _YDL_COMMON_OPTS = {
     # _ydl_js_runtimes). Without it only storyboard placeholder formats return.
     "js_runtimes": _ydl_js_runtimes(),
 }
+if _YDL_COMMON_OPTS["js_runtimes"]:
+    print(f"[INIT] yt-dlp JavaScript runtime: {_YDL_COMMON_OPTS['js_runtimes']}", flush=True)
+else:
+    print("[INIT] WARNING: no yt-dlp JavaScript runtime found; YouTube playback may fail", flush=True)
 
 # YDL options shared across extract-only sites (no postprocess, no outtmpl).
 # retries=1 cuts the fallback-retry-storm when yt-dlp hits an auth-error in
@@ -796,7 +898,7 @@ def _load_settings() -> dict:
 
 def _save_settings(data: dict):
     global _settings_cache, _settings_cache_ts
-    SETTINGS_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(SETTINGS_JSON, data)
     _settings_cache = dict(data)
     _settings_cache_ts = time.time()
 
@@ -1917,7 +2019,7 @@ def api_favorites():
 def api_save_favorites():
     try:
         favs = request.get_json(force=True)
-        FAVORITES_JSON.write_text(json.dumps(favs, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(FAVORITES_JSON, favs)
         _invalidate_favorites_cache()
         # Only enqueue favourites that are genuinely missing material locally.
         # The previous version submitted the ENTIRE favourites list to the bounded
@@ -2842,14 +2944,14 @@ def api_settings_wipe():
     removed = 0
 
     # Overwrite rather than unlink the core files so their expected schemas remain valid.
-    for path, contents in ((FAVORITES_JSON, "[]"), (SETTINGS_JSON, json.dumps(defaults, ensure_ascii=False, indent=2))):
+    for path, data in ((FAVORITES_JSON, []), (SETTINGS_JSON, defaults)):
         try:
-            path.write_text(contents, encoding="utf-8")
+            _atomic_write_json(path, data)
         except OSError:
             failed += 1
 
     try:
-        STATS_JSON.write_text(json.dumps(_empty_stats_doc(), ensure_ascii=False), encoding="utf-8")
+        _atomic_write_json(STATS_JSON, _empty_stats_doc())
         _invalidate_stats_cache()
     except OSError:
         failed += 1
@@ -3558,6 +3660,51 @@ def api_lyrics():
     # the same unlyricked track don't re-hit every provider each time. (L2)
     _write_lyrics_cache(tid, result, neg_ttl=7 * 24 * 3600)
     return jsonify(result)
+
+# Host whitelist for the word-lyric JSON proxy (see api_proxy_json below).
+_JSON_PROXY_ALLOWED_HOSTS = {"music.163.com", "lrclib.net"}
+_JSON_PROXY_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+@app.route("/api/proxy_json")
+def api_proxy_json():
+    """Same-origin JSON proxy for the per-word lyric fetcher.
+
+    WebView2 enforces CORS and music.163.com sends no Access-Control-Allow-
+    Origin header, so the renderer can never read NetEase responses directly.
+    This route fetches a host-whitelisted URL server-side and returns the JSON.
+    Used only by static/js/word-lyric-fetcher.js as a CORS workaround.
+    """
+    url = request.args.get("url", "")
+    if len(url) > 512:
+        return jsonify({"error": "url too long"}), 400
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return jsonify({"error": "bad url"}), 400
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in _JSON_PROXY_ALLOWED_HOSTS:
+        return jsonify({"error": "host not allowed"}), 403
+    headers = {
+        "User-Agent": _JSON_PROXY_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    referer = request.args.get("referer", "")
+    if referer and len(referer) <= 256:
+        headers["Referer"] = referer
+    try:
+        resp = requests.get(url, headers=headers, timeout=12)
+    except requests.RequestException:
+        return jsonify({"error": "upstream error"}), 502
+    if resp.status_code != 200:
+        return jsonify({"error": f"upstream status {resp.status_code}"}), resp.status_code
+    try:
+        return jsonify(resp.json())
+    except ValueError:
+        return jsonify({"error": "not json"}), 502
 
 @app.route("/api/download/status")
 def api_download_status():
@@ -4553,7 +4700,8 @@ def mobile_player_test():
 GITHUB_PUBLIC_CLIENT_ID = "Ov23li7yj6nyzq9MqcIy"
 GITHUB_DEVICE_SCOPE = "public_repo,gist"
 GITHUB_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
-_COMMUNITY_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) / "AkiMelody"
+_COMMUNITY_DATA_DIR = BASE_DIR
+_COMMUNITY_DATA_DIR.mkdir(parents=True, exist_ok=True)
 COMMUNITY_THEMES_JSON = _COMMUNITY_DATA_DIR / "community_themes.json"
 COMMUNITY_PLAYLISTS_JSON = _COMMUNITY_DATA_DIR / "community_playlists.json"
 
@@ -4651,17 +4799,17 @@ def _save_community_playlists(items: list) -> None:
 @app.route("/api/github/config")
 def api_github_config():
     cid = _github_client_id()
-    token = ""
+    authenticated = False
     user = {}
     try:
         s = _load_settings()
-        token = s.get("github_token", "") or ""
+        authenticated = bool(s.get("github_token", ""))
         user = s.get("github_user", {}) or {}
     except Exception:
         pass
     return jsonify({
         "configured": bool(cid),
-        "token": token,
+        "authenticated": authenticated,
         "user": user,
     })
 
@@ -5121,7 +5269,7 @@ def api_community_playlists_delete():
 #   Proxies GitHub releases API + chunked installer download to local disk.
 #   Designed so the pywebview shell (or standalone Flask mode) can poll
 #   /api/update/check every 6h, then /api/update/download to stream the
-#   installer to %LOCALAPPDATA%\AkiMelody\updates\, and finally
+#   installer to the shared AkiMelody data root's updates\ directory, then
 #   /api/update/launch to shell-execute the installer on Restart-to-Update.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -5142,15 +5290,12 @@ _update_state = {
 }
 _update_lock = threading.Lock()
 _update_thread = None          # the background download worker (if running)
+_approved_update_assets = {}   # release tag -> asset metadata from GitHub check
 
-# Where to store the installer binary. Mirrors the data dir strategy from
-# webview_launcher.py (kept out of the install dir which may be read-only).
+# Installer cache shared by every launch mode and kept separate from code.
 def _update_dir():
-    """Installer scratch dir: %LOCALAPPDATA%\\AkiMelody\\updates in packaged mode, else SAVED/updates."""
-    if os.environ.get("LOCALAPPDATA"):
-        d = Path(os.environ["LOCALAPPDATA"]) / "AkiMelody" / "updates"
-    else:
-        d = SAVED_DIR / "updates"
+    """Return the shared private installer cache directory."""
+    d = DATA_PATHS.updates
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -5226,8 +5371,8 @@ def api_update_check():
         remote_tuple = _parse_semver(remote_tag)
         update_available = _semver_gt(remote_tuple, local_tuple)
 
-        # Pick the first .exe asset (the Windows installer). Fallback: first
-        # asset of any kind so users on a manually-named build still get one.
+        # Only executable release assets can enter the install flow. The
+        # browser never gets to nominate an arbitrary URL for execution.
         assets = data.get("assets") or []
         pickup = None
         for a in assets:
@@ -5235,8 +5380,40 @@ def api_update_check():
             if name.endswith(".exe"):
                 pickup = a
                 break
-        if pickup is None and assets:
-            pickup = assets[0]
+
+        approved_asset = None
+        asset_error = ""
+        if pickup:
+            asset_url = pickup.get("browser_download_url") or ""
+            try:
+                asset_size = int(pickup.get("size") or 0)
+            except (TypeError, ValueError):
+                asset_size = 0
+            if not is_allowed_update_url(asset_url):
+                asset_error = "untrusted_asset_url"
+            elif asset_size <= 0 or asset_size > UPDATE_MAX_BYTES:
+                asset_error = "invalid_asset_size"
+            else:
+                approved_asset = {
+                    "name": pickup.get("name") or "AkiMelody-Setup.exe",
+                    "url": asset_url,
+                    "size": asset_size,
+                    "release_notes": data.get("body") or "",
+                    "release_html_url": data.get("html_url") or "",
+                    "published_at": data.get("published_at") or "",
+                    "approved_at": time.time(),
+                }
+                if remote_tag:
+                    with _update_lock:
+                        _approved_update_assets[remote_tag] = dict(approved_asset)
+                        # A tiny bounded cache is enough for repeated checks and
+                        # prevents stale releases accumulating indefinitely.
+                        while len(_approved_update_assets) > 8:
+                            oldest = min(
+                                _approved_update_assets,
+                                key=lambda tag: _approved_update_assets[tag].get("approved_at", 0),
+                            )
+                            _approved_update_assets.pop(oldest, None)
 
         return jsonify({
             "ok": True,
@@ -5251,10 +5428,11 @@ def api_update_check():
             "release_html_url": data.get("html_url") or "",
             "published_at": data.get("published_at") or "",
             "asset": {
-                "name": pickup.get("name") if pickup else "",
-                "url": pickup.get("browser_download_url") if pickup else "",
-                "size": pickup.get("size") if pickup else 0,
-            } if pickup else None,
+                "name": approved_asset["name"],
+                "url": approved_asset["url"],
+                "size": approved_asset["size"],
+            } if approved_asset else None,
+            "asset_error": asset_error,
             "repo": UPDATE_REPO,
         })
     except Exception as e:
@@ -5269,13 +5447,15 @@ def api_update_status():
         return jsonify(dict(_update_state))
 
 
-def _download_worker(url, dest_path, asset_name):
+def _download_worker(url, dest_path, asset_name, expected_size):
     """Background thread: streams `url` to `dest_path` with progress updates.
     Uses a fresh requests.Session so it never reuses auth cookies from
-    YTMusic/iTunes sessions. Resumable on retry via Range header."""
+    YTMusic/iTunes sessions. Size and redirect targets are checked before the
+    temporary file can become an executable installer."""
     global _update_thread
     sess = requests.Session()
     sess.headers.update({"User-Agent": "AkiMelody-Updater"})
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
     try:
         with _update_lock:
             _update_state.update({
@@ -5285,10 +5465,16 @@ def _download_worker(url, dest_path, asset_name):
             })
         # Stream to a temp file first so a partial download is never
         # mistaken for a complete installer on the next launch.
-        tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
         with sess.get(url, stream=True, timeout=30, allow_redirects=True) as r:
             r.raise_for_status()
-            total = int(r.headers.get("Content-Length") or 0)
+            if not is_allowed_update_url(r.url):
+                raise ValueError("update_redirect_not_trusted")
+            declared_size = int(r.headers.get("Content-Length") or 0)
+            if declared_size > UPDATE_MAX_BYTES:
+                raise ValueError("update_too_large")
+            if expected_size and declared_size and declared_size != expected_size:
+                raise ValueError("update_size_mismatch")
+            total = expected_size or declared_size
             with _update_lock:
                 _update_state["total"] = total
             received = 0
@@ -5299,6 +5485,8 @@ def _download_worker(url, dest_path, asset_name):
                         continue
                     fh.write(chunk)
                     received += len(chunk)
+                    if received > UPDATE_MAX_BYTES or (expected_size and received > expected_size):
+                        raise ValueError("update_too_large")
                     with _update_lock:
                         _update_state["received"] = received
                     if total:
@@ -5307,7 +5495,10 @@ def _download_worker(url, dest_path, asset_name):
                             last_pct = pct
                             with _update_lock:
                                 _update_state["progress"] = pct
-            # Rename .part → final only when the write completed fully.
+            if expected_size and received != expected_size:
+                raise ValueError("update_size_mismatch")
+            # Rename .part → final only when the write completed and its size
+            # matches the GitHub release metadata approved by update/check.
             tmp_path.replace(dest_path)
         with _update_lock:
             _update_state.update({
@@ -5315,6 +5506,11 @@ def _download_worker(url, dest_path, asset_name):
                 "local_path": str(dest_path),
             })
     except Exception as e:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
         with _update_lock:
             _update_state.update({"status": "error", "error": str(e)})
         log.warning(f"Update download failed: {e}")
@@ -5329,35 +5525,41 @@ def api_update_download():
     without restarting; a previously-completed download returns `ready`."""
     global _update_thread
     body = request.get_json(silent=True) or {}
-    url = body.get("url")
-    name = body.get("name") or "AkiMelody-setup.exe"
-    release_tag = body.get("release_tag") or ""
-    release_notes = body.get("release_notes") or ""
-    release_html_url = body.get("release_html_url") or ""
+    release_tag = str(body.get("release_tag") or "").strip()
 
     with _update_lock:
         cur = _update_state["status"]
         if cur == "downloading" and _update_thread and _update_thread.is_alive():
             return jsonify({"ok": True, "state": dict(_update_state), "already_running": True})
-        if cur == "ready" and _update_state.get("local_path") and Path(_update_state["local_path"]).exists():
+        if (cur == "ready" and _update_state.get("release_tag") == release_tag
+                and _update_state.get("local_path")
+                and is_trusted_installer(_update_state["local_path"], _update_dir())
+                and Path(_update_state["local_path"]).exists()):
             return jsonify({"ok": True, "state": dict(_update_state), "already_ready": True})
+        approved = dict(_approved_update_assets.get(release_tag) or {})
 
-    if not url:
-        return jsonify({"ok": False, "error": "url_required"}), 400
+    if not approved:
+        return jsonify({"ok": False, "error": "release_not_approved"}), 409
 
     # Stable filename: include the release tag so multiple releases' installers
     # coexist in the cache dir and the user can roll back manually.
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name or "AkiMelody-setup")
-    dest = _update_dir() / f"{release_tag or 'unknown'}_{safe_name}"
+    safe_tag = safe_filename_component(release_tag, "unknown")
+    safe_name = safe_filename_component(approved.get("name"), "AkiMelody-Setup.exe")
+    if not safe_name.lower().endswith(".exe"):
+        return jsonify({"ok": False, "error": "invalid_installer_type"}), 409
+    dest = _update_dir() / f"{safe_tag}_{safe_name}"
+    if not is_trusted_installer(dest, _update_dir()):
+        return jsonify({"ok": False, "error": "invalid_installer_path"}), 409
 
     with _update_lock:
         _update_state.update({
             "release_tag": release_tag,
-            "release_notes": release_notes,
-            "release_html_url": release_html_url,
+            "release_notes": approved.get("release_notes") or "",
+            "release_html_url": approved.get("release_html_url") or "",
         })
     _update_thread = threading.Thread(
-        target=_download_worker, args=(url, dest, name),
+        target=_download_worker,
+        args=(approved["url"], dest, approved["name"], approved["size"]),
         daemon=True, name="AkiUpdateDownload"
     )
     _update_thread.start()
@@ -5385,7 +5587,9 @@ def api_update_launch():
     with _update_lock:
         path = _update_state.get("local_path") or ""
         status = _update_state.get("status")
-    if status != "ready" or not path or not Path(path).exists():
+    if (status != "ready" or not path
+            or not is_trusted_installer(path, _update_dir())
+            or not Path(path).is_file()):
         return jsonify({"ok": False, "error": "installer_not_ready"}), 409
 
     try:
@@ -5471,7 +5675,7 @@ def api_update_clear():
             "release_notes": "", "release_html_url": "", "error": "",
             "local_path": "",
         })
-    if path:
+    if path and is_trusted_installer(path, _update_dir()):
         try:
             p = Path(path)
             if p.exists():
@@ -5486,7 +5690,7 @@ def api_update_clear():
     return jsonify({"ok": True})
 
 
-_CHANGELOG_PATH = BASE_DIR / "CHANGELOG.md"
+_CHANGELOG_PATH = RESOURCE_DIR / "CHANGELOG.md"
 
 
 @app.route("/api/update/changelog")
@@ -5509,5 +5713,5 @@ def api_update_changelog():
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    print("[AkiMelody] server listening on http://0.0.0.0:5000", flush=True)
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    print(f"[AkiMelody] server listening on http://{SERVER_BIND_HOST}:{SERVER_PORT}", flush=True)
+    app.run(host=SERVER_BIND_HOST, port=SERVER_PORT, debug=False, use_reloader=False)

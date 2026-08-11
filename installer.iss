@@ -10,12 +10,15 @@
 ;  Silent installs (/SILENT /VERYSILENT) auto-relaunch AkiMelody afterward.
 ; ============================================================================
 
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
+#ifndef BundleDir
+#define BundleDir "dist\AkiMelody"
+#endif
 
 [Setup]
 ; App identity — change AppId per major version to allow side-by-side installs.
 AppId={{AkiMelody-2026-08-05-r1}
-AppVersion=1.0.2
+AppVersion=1.0.3
 AppVerName=AkiMelody {#MyAppVersion}
 AppName=AkiMelody
 AppPublisher=AkiMelody
@@ -28,8 +31,8 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
 ; Install into the user's LocalAppData so it works without admin rights and
-; survives alongside the WebView2 profile / SAVED dirs that live in
-; %LOCALAPPDATA%\AkiMelody.
+; user data lives separately in %LOCALAPPDATA%\AkiMelody\data and is never
+; part of the files packaged by this installer.
 DefaultDirName={localappdata}\AkiMelody
 DefaultGroupName=AkiMelody
 AllowNoIcons=yes
@@ -75,7 +78,7 @@ Name: "startupicon"; Description: "Start AkiMelody on login"; GroupDescription: 
 [Files]
 ; The PyInstaller --onedir output. build.py produces dist\AkiMelody\ containing
 ; AkiMelody.exe + _internal\ (DLLs, packages, etc.). Recurse to grab everything.
-Source: "dist\AkiMelody\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Ship the icon for the Start Menu / Desktop shortcuts.
 Source: "build\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 
@@ -95,8 +98,8 @@ Root: HKCU; Subkey: "Software\AkiMelody"; ValueType: string; ValueName: "Install
 Root: HKCU; Subkey: "Software\AkiMelody"; ValueType: string; ValueName: "Version"; ValueData: "{#MyAppVersion}"; Flags: uninsdeletekey
 
 [UninstallDelete]
-; Leave user data (SAVED, favorites, playlists, WebView2 profile) untouched.
-; Only clean up the install dir itself.
+; Leave the data\ subtree (SAVED, favorites, playlists, WebView2 profile)
+; untouched. Only explicitly clean generated application files here.
 Type: filesandordirs; Name: "{app}\_internal"
 Type: files; Name: "{app}\AkiMelody.exe"
 
