@@ -34,6 +34,7 @@ BUILD = ROOT / "build"
 SPEC_DIR = BUILD / "spec"
 WORK_DIR = BUILD / "pyinstaller"
 ACTIVE_BUNDLE_DIR = DIST / "AkiMelody"
+MYAPP_VERSION = "1.0.3"
 FORBIDDEN_BUNDLE_FILES = {
     "cookies.txt",
     "headers.json",
@@ -137,6 +138,43 @@ def build_onedir(skip_clean: bool = False) -> int:
     # PyInstaller --add-data separator is ; on Windows, : on POSIX.
     sep = ";" if os.name == "nt" else ":"
 
+    # Version info for Windows file properties (Details tab)
+    version_file = ROOT / "build" / "version_info.txt"
+    if not version_file.exists():
+        # PyInstaller expects a text file with version info in VSVersionInfo format
+        # Using the standard format recognized by PyInstaller's version parsing
+        version_parts = MYAPP_VERSION.split('.')
+        filevers = tuple(int(x) for x in version_parts + ['0'] * (4 - len(version_parts)))
+        version_file.write_text(f"""
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={filevers},
+    prodvers={filevers},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'AkiMelody'),
+        StringStruct(u'FileDescription', u'AkiMelody Music Player'),
+        StringStruct(u'FileVersion', u'{MYAPP_VERSION}'),
+        StringStruct(u'InternalName', u'AkiMelody'),
+        StringStruct(u'LegalCopyright', u'Copyright (C) 2024 AkiMelody'),
+        StringStruct(u'OriginalFilename', u'AkiMelody.exe'),
+        StringStruct(u'ProductName', u'AkiMelody'),
+        StringStruct(u'ProductVersion', u'{MYAPP_VERSION}')])
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+""", encoding="utf-8")
+
     args = [
         sys.executable, "-m", "PyInstaller",
         "--name", "AkiMelody",
@@ -155,6 +193,8 @@ def build_onedir(skip_clean: bool = False) -> int:
         "--distpath", str(ACTIVE_BUNDLE_DIR.parent),
         # App icon.
         "--icon", str(ROOT / "build" / "icon.ico"),
+        # Version info for Windows file properties.
+        "--version-file", str(version_file),
         # Clean build dir between runs.
         "--clean",
     ]

@@ -7,9 +7,11 @@ import requests
 try:
     from curl_cffi.requests import Session as _CurlSession
     _curl = _CurlSession(impersonate="chrome")
+    _stream_curl = _CurlSession(impersonate="chrome")
     print("[INIT] curl_cffi loaded — Chrome TLS impersonation active", flush=True)
 except Exception as _e:
     _curl = None
+    _stream_curl = None
     print(f"[INIT] curl_cffi unavailable ({_e}), falling back to requests", flush=True)
 import re
 import secrets
@@ -22,13 +24,16 @@ import struct
 import hashlib
 import random
 import shutil
+import tempfile
 import logging
 import unicodedata
 import urllib.parse
 import wikipediaapi
+from difflib import SequenceMatcher
+from contextlib import contextmanager
 from pathlib import Path
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from ytmusicapi import YTMusic
 import ytmusic_auth as yauth
 from data_paths import prepare_data_paths, resolve_bundled_tool
@@ -40,7 +45,7 @@ from security_utils import (
     is_trusted_installer,
     safe_filename_component,
 )
-# Cover Art Fetching Engine — async ISRC-first pipeline (artwork_fetcher.py).
+# Cover Art Fetching Engine — uniform ranked provider pipeline.
 # Imported lazily so a missing httpx in a stripped-down dev env never breaks
 # Flask startup; the enrich route resolves it on first use.
 artwork_fetcher = None
@@ -49,6 +54,7 @@ def _ensure_artwork_fetcher():
     if artwork_fetcher is None:
         import artwork_fetcher as _af
         artwork_fetcher = _af
+        artwork_fetcher.configure_cache(BASE_DIR / "artwork_resolutions.json")
     return artwork_fetcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -57,7 +63,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.5"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -124,6 +130,10 @@ SERVER_PORT = int(os.environ.get("AKI_SERVER_PORT", "5000"))
 LAN_ACCESS_ENABLED = env_flag("AKI_ALLOW_LAN")
 LAN_ACCESS_TOKEN = os.environ.get("AKI_LAN_TOKEN", "").strip()
 LAN_ACCESS_COOKIE = "aki_lan_access"
+ANDROID_ACCESS_TOKEN = os.environ.get("AKI_ANDROID_TOKEN", "").strip()
+ANDROID_ACCESS_COOKIE = "aki_android_access"
+IS_ANDROID = env_flag("AKI_ANDROID")
+SYNCEDLYRICS_ENABLED = not IS_ANDROID
 SERVER_BIND_HOST = "0.0.0.0" if LAN_ACCESS_ENABLED else "127.0.0.1"
 if LAN_ACCESS_ENABLED and len(LAN_ACCESS_TOKEN) < 20:
     raise RuntimeError(
@@ -137,6 +147,39 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request body
 def _protect_local_service():
     """Keep LAN access authenticated and reject browser cross-site writes."""
     remote_is_local = is_loopback_address(request.remote_addr)
+
+    # Android apps share a device network namespace, so loopback binding alone
+    # doesn't prove the caller is our WebView. The shell supplies a fresh token
+    # at process startup, exchanges it once for an HttpOnly cookie, and never
+    # exposes it to JavaScript or persistent storage.
+    if ANDROID_ACCESS_TOKEN:
+        supplied = request.headers.get("X-Aki-Android-Token", "") or request.cookies.get(ANDROID_ACCESS_COOKIE, "")
+        query_token = request.args.get("android_token", "")
+        if request.method == "GET" and request.path == "/mobile" and query_token:
+            if secrets.compare_digest(query_token, ANDROID_ACCESS_TOKEN):
+                query = [
+                    (key, value)
+                    for key in request.args
+                    if key != "android_token"
+                    for value in request.args.getlist(key)
+                ]
+                target = request.path
+                if query:
+                    target += "?" + urllib.parse.urlencode(query)
+                response = _flask_redirect(target)
+                response.set_cookie(
+                    ANDROID_ACCESS_COOKIE,
+                    ANDROID_ACCESS_TOKEN,
+                    httponly=True,
+                    samesite="Strict",
+                    secure=False,
+                )
+                response.headers["Cache-Control"] = "no-store"
+                return response
+        if not supplied or not secrets.compare_digest(supplied, ANDROID_ACCESS_TOKEN):
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "android_auth_required"}), 401
+            return Response("AkiMelody Android access token required.", status=401, mimetype="text/plain")
 
     if LAN_ACCESS_ENABLED and not remote_is_local:
         supplied = request.headers.get("X-Aki-Token", "") or request.cookies.get(LAN_ACCESS_COOKIE, "")
@@ -202,13 +245,29 @@ FAVORITES_JSON = BASE_DIR / "favorites.json"
 MUSIC_LIBRARY_DIR = DATA_PATHS.music_library
 PLAYLISTS_DIR = DATA_PATHS.playlists
 PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
+PLAYLIST_STAGING_DIR = PLAYLISTS_DIR / ".staging"
+PLAYLIST_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 LYRICS_DIR = DATA_PATHS.lyrics
 LYRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 _STREAM_CACHE_MAX = 100
 _stream_cache = OrderedDict()  # tid -> {"url": str, "exp": float}  (LRU, max _STREAM_CACHE_MAX)
 _stream_cache_lock = threading.Lock()
+_stream_resolution_lock = threading.Lock()
+_stream_resolution_inflight = {}
 _STREAM_URL_EXPIRE_RE = re.compile(r"[?&]expire=(\d+)")
+
+# Stable recording identities live much longer than googlevideo stream URLs.
+# Keeping these caches separate lets queue look-ahead resolve an imported track
+# early without creating an expiring audio URL until playback is close.
+RECORDING_RESOLUTIONS_JSON = BASE_DIR / "recording_resolutions.json"
+_RECORDING_RESOLUTION_SCHEMA = 2
+_RECORDING_RESOLUTION_TTL = 45 * 24 * 60 * 60
+_RECORDING_RESOLUTION_MAX = 2500
+_recording_resolution_cache = None
+_recording_resolution_lock = threading.RLock()
+_recording_resolution_inflight = {}
+_recording_prefetch_pending = set()
 
 def _invalidate_stream_cache():
     """Clear all yt-dlp stream URLs from the cache. Called after cookie refresh,
@@ -225,14 +284,19 @@ def _extract_url_expiry(url: str) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-def _cache_stream(tid: str, url: str) -> None:
+def _cache_stream(tid: str, url: str, identity: str = "", metadata: dict | None = None) -> None:
     """LRU-bound write under _stream_cache_lock. Single source of truth for stream
     URL caching. Skip writes when tid is empty (route variants can call without a tid).
     Stores the parsed `expire=<unix_secs>` so readers can evict stale entries proactively."""
     if not tid:
         return
     with _stream_cache_lock:
-        _stream_cache[tid] = {"url": url, "exp": _extract_url_expiry(url)}
+        entry = {"url": url, "exp": _extract_url_expiry(url), "identity": identity}
+        if metadata:
+            for key in ("matchedVideoId", "matchConfidence", "recordingResolved"):
+                if metadata.get(key) is not None:
+                    entry[key] = metadata[key]
+        _stream_cache[tid] = entry
         if len(_stream_cache) > _STREAM_CACHE_MAX:
             _stream_cache.popitem(last=False)
 
@@ -249,9 +313,16 @@ def has_valid_auth_state() -> bool:
 _download_status = OrderedDict()  # tid -> {"ok": bool, "error": str|None}
 _download_status_lock = threading.Lock()
 _DOWNLOAD_STATUS_MAX = 500
+_artwork_jobs = OrderedDict()
+_artwork_jobs_lock = threading.Lock()
+_ARTWORK_JOBS_MAX = 100
 
 _playlist_index_cache = None   # cached list from api_playlists
 _playlist_index_lock = threading.Lock()
+_playlist_index_generation = 0
+_playlist_catalog_lock = threading.RLock()
+_playlist_locks_guard = threading.Lock()
+_playlist_locks = {}
 
 # ── Shared HTTP sessions (connection pooling) ─────────────────────────────────
 _itunes_session = requests.Session()
@@ -262,15 +333,28 @@ _itunes_session.headers.update({
 _lrclib_session = requests.Session()
 _lrclib_session.headers.update({"Accept": "application/json"})
 
-# ── iTunes art cache + concurrency limiter ────────────────────────────────────
-_itunes_art_cache = OrderedDict()  # query_key -> {album_art, art, artist_name, dur, duration, enhanced}
-_ITUNES_ART_CACHE_MAX = 500
-_itunes_art_lock = threading.Lock()
-_itunes_semaphore = threading.Semaphore(2)  # max 2 concurrent iTunes requests
+
+class _BoundedRequestsSession(requests.Session):
+    """Session with a default deadline for libraries which omit one."""
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", 15)
+        return super().request(method, url, **kwargs)
 
 # ── Shared thread pool (avoids per-request creation/teardown) ─────────────────
 _io_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="aki-io")
 _download_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="aki-dl")
+_offline_collection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aki-offline")
+_offline_asset_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aki-offline-assets")
+_resolution_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aki-resolve")
+_artwork_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aki-art")
+_stream_warm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aki-stream-warm")
+_stream_warm_lock = threading.Lock()
+_stream_warm_latest = {}
+_stream_warm_pending = set()
+
+_offline_collection_jobs = OrderedDict()
+_offline_collection_jobs_lock = threading.Lock()
+_OFFLINE_COLLECTION_JOBS_MAX = 100
 
 # ── Settings cache (avoids disk read on every /api/settings call) ──────────────
 _settings_cache = None
@@ -544,6 +628,7 @@ def _aggregate_locked(data, period_days=None):
 _lyrics_mem_cache = OrderedDict()  # tid -> {synced, lines}
 _LYRICS_MEM_CACHE_MAX = 500
 _lyrics_mem_lock = threading.Lock()
+_LYRICS_CACHE_VERSION = 2
 
 # ── Artist bio cache (LRU with TTL) ──────────────────────────────────────────
 _artist_bio_cache = OrderedDict()  # name -> (result, timestamp)
@@ -553,7 +638,7 @@ _ARTIST_BIO_CACHE_TTL = 3600  # 1 hour
 
 # ── Radio suggestion cache (LRU with TTL) ─────────────────────────────────────
 # Radio mode re-seeds the same video id many times per session, and each seed
-# triggers an expensive get_watch_playlist() + per-track iTunes artwork lookup.
+# triggers an expensive get_watch_playlist() + per-track artwork resolution.
 # Caching the resolved result per seed vid avoids hammering YouTube Music /
 # Apple after only a handful of songs.
 _radio_suggest_cache = OrderedDict()  # vid -> (timestamp, [sanitized tracks])
@@ -594,7 +679,7 @@ _ARTIST_IMAGE_CACHE_TTL = 86400  # 24 hours
 # get_liked_songs() is an authenticated, moderately expensive call.
 _liked_cache = {}  # limit -> (timestamp, payload)
 _liked_lock = threading.Lock()
-_LIKED_TTL = 60  # 1 minute
+_LIKED_TTL = 30  # 30 seconds - shorter to reduce stale auth window
 
 # ── YT Music search cache (LRU with TTL) ───────────────────────────────────────
 # Search results are stable for minutes; caching avoids repeated YouTube Music
@@ -609,6 +694,14 @@ _SEARCH_TTL = 300  # 5 minutes
 # ytmusicapi also uses cookies for authenticated access (playlists, likes, etc.)
 _yt_cookie_file = BASE_DIR / "cookies.txt"
 _yt_headers_file = BASE_DIR / "headers.json"
+_yt_oauth_file = BASE_DIR / "oauth.json"
+_yt_oauth_credentials_file = BASE_DIR / "youtube_oauth_credentials.json"
+_youtube_oauth_pending = OrderedDict()
+_youtube_oauth_lock = threading.Lock()
+_YOUTUBE_OAUTH_PENDING_MAX = 4
+_YOUTUBE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
+_YOUTUBE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_YOUTUBE_OAUTH_SCOPE = "https://www.googleapis.com/auth/youtube"
 
 # Fallback: Tauri release mode writes to LOCALAPPDATA/com.akimelody.app/
 _tauri_data_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "com.akimelody.app"
@@ -656,23 +749,32 @@ def _load_cookies_to_session(session, cookie_text: str):
             continue
         domain, _, path, secure, expires, name, value = parts[:7]
         if 'google.com' in domain or 'youtube.com' in domain:
-            session.cookies.set(name, value, domain=domain, path=path)
+            kwargs = {"domain": domain, "path": path}
+            if expires and expires != "0":
+                try:
+                    kwargs["expires"] = int(expires)
+                except Exception:
+                    pass
+            session.cookies.set(name, value, **kwargs)
 
 def _generate_auth_headers(cookie_text: str) -> bool:
     """Generate headers.json for ytmusicapi from cookies.txt content.
-    Includes BOTH youtube.com and google.com domain cookies because the
-    SAPISIDHASH authorization ytmusicapi computes needs the SAPISID cookie
-    which lives on .google.com. Excluding google.com cookies produces a
-    headers.json that silently fails auth (0.1 kb, no real cookies)."""
-    cookie_header = _parse_netscape_cookies(cookie_text, youtube_only=False)
+    The request Cookie header mirrors what a browser sends to music.youtube.com:
+    only YouTube-domain cookies. Google-domain cookies remain in cookies.txt and
+    the requests cookie jar, but are never flattened into a cross-domain header."""
+    cookie_header = _parse_netscape_cookies(cookie_text, youtube_only=True)
     if not cookie_header:
         print("[AUTH] _generate_auth_headers: no cookies parsed from cookie text", flush=True)
         return False
 
-    # Extract SAPISID from parsed cookies for real SAPISIDHASH
+    # Extract SAPISID or __Secure-1PSID from parsed cookies for real SAPISIDHASH
     sapisid = None
-    for pair in cookie_header.split("; "):
+    all_cookie_header = _parse_netscape_cookies(cookie_text, youtube_only=False)
+    for pair in (cookie_header + "; " + all_cookie_header).split("; "):
         if pair.startswith("SAPISID="):
+            sapisid = pair.split("=", 1)[1]
+            break
+        if pair.startswith("__Secure-1PSID="):
             sapisid = pair.split("=", 1)[1]
             break
 
@@ -684,28 +786,30 @@ def _generate_auth_headers(cookie_text: str) -> bool:
         "X-Origin": "https://music.youtube.com",
     }
 
-    # Compute real SAPISIDHASH if SAPISID is present
+    # Compute real SAPISIDHASH if SAPISID or __Secure-1PSID is present
     if sapisid:
         try:
             import ytmusic_auth as yauth
             headers["authorization"] = yauth.compute_sapisidhash(sapisid)
-            print("[AUTH] Computed real SAPISIDHASH from SAPISID cookie", flush=True)
+            print("[AUTH] Computed real SAPISIDHASH from cookie", flush=True)
         except Exception as exc:
             print(f"[AUTH] Failed to compute SAPISIDHASH: {exc} — using placeholder", flush=True)
             headers["authorization"] = "SAPISIDHASH 0_dummy"
     else:
         headers["authorization"] = "SAPISIDHASH 0_dummy"
-        print("[AUTH] No SAPISID cookie found — using placeholder SAPISIDHASH", flush=True)
+        print("[AUTH] No SAPISID/__Secure-1PSID cookie found — using placeholder SAPISIDHASH", flush=True)
 
     try:
         _yt_headers_file.write_text(json.dumps(headers, indent=2), encoding="utf-8")
         # Log which auth cookies are present for diagnostics
         names = [p.split("=", 1)[0] for p in cookie_header.split("; ") if "=" in p]
-        has_sapisid = "SAPISID" in names
-        has_sid = "SID" in names
+        all_names = [p.split("=", 1)[0] for p in (cookie_header + "; " + all_cookie_header).split("; ") if "=" in p]
+        has_sapisid = "SAPISID" in all_names
+        has_secure_1psid = "__Secure-1PSID" in all_names
+        has_sid = "SID" in all_names
         print(f"[AUTH] Generated headers.json ({_yt_headers_file.stat().st_size} bytes): "
-              f"SAPISID={'YES' if has_sapisid else 'NO'}, SID={'YES' if has_sid else 'NO'}, "
-              f"total_cookies={len(names)}", flush=True)
+              f"SAPISID={'YES' if has_sapisid else 'NO'}, __Secure-1PSID={'YES' if has_secure_1psid else 'NO'}, "
+              f"SID={'YES' if has_sid else 'NO'}, total_cookies={len(all_names)}", flush=True)
         return True
     except Exception as e:
         print(f"[INIT] Failed to generate headers.json: {e}", flush=True)
@@ -807,6 +911,19 @@ _YDL_EXTRACT_OPTS = {
     "retries": 1,
 }
 
+# Downloads should fail quickly enough to retry with a fresh extraction, while
+# still tolerating the short connection stalls which are common on phones.
+# Keep this separate from extract-only options: fragment retries only apply
+# while media bytes are being written.
+_YDL_DOWNLOAD_OPTS = {
+    **_YDL_COMMON_OPTS,
+    "socket_timeout": 20,
+    "retries": 2,
+    "fragment_retries": 2,
+    "extractor_retries": 1,
+    "concurrent_fragment_downloads": 2,
+}
+
 # Module-level UA shared across all yt-dlp sites for the http_headers key.
 _YDL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -814,29 +931,132 @@ _YDL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 _file_index = {}  # filename -> Path (absolute)
 _file_index_lock = threading.Lock()
 _file_index_ts = 0.0
-_FILE_INDEX_TTL = 30.0
+_FILE_INDEX_TTL = 300.0
+_LOCAL_AUDIO_EXTENSIONS = (".mp3", ".m4a", ".webm", ".opus")
+_LOCAL_MEDIA_EXTENSIONS = frozenset((*_LOCAL_AUDIO_EXTENSIONS, ".jpg", ".jpeg", ".png", ".webp"))
+_LOCAL_MEDIA_MIMETYPES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".webm": "audio/webm",
+    ".opus": "audio/ogg",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def _local_media_mimetype(path: Path) -> str | None:
+    """Return an explicit WebView-safe MIME type for downloaded media.
+
+    Chaquopy's compact Python runtime doesn't always ship the same mimetype
+    table as desktop Python. With ``nosniff`` enabled, an octet-stream response
+    can therefore be rejected by Android's media element even when the bytes
+    are a valid m4a/webm/opus file.
+    """
+    return _LOCAL_MEDIA_MIMETYPES.get(path.suffix.lower())
+
+
+def _indexed_media_key(path: Path) -> str:
+    """Return the canonical lookup name for a playlist media file.
+
+    Playlist downloads may be stored as ``01 - <tid>.mp3`` to preserve album
+    ordering. Playback addresses media by the universal track id, so index a
+    numbered file under ``<tid>.mp3`` as well as its physical filename.
+    """
+    if path.suffix.lower() not in _LOCAL_AUDIO_EXTENSIONS:
+        return path.name
+    stem = path.stem
+    if " - " in stem:
+        prefix, candidate = stem.split(" - ", 1)
+        if prefix.isdigit() and candidate:
+            return f"{candidate}{path.suffix.lower()}"
+    return path.name
 
 def _get_file_index():
     global _file_index, _file_index_ts
     now = time.time()
+    # Rebuild under the lock. The earlier check-then-scan implementation let
+    # /api/stream and /api/media/status recursively scan the same library at
+    # the same time after expiry, exactly when playback needed the disk least.
     with _file_index_lock:
         if _file_index and (now - _file_index_ts) < _FILE_INDEX_TTL:
             return _file_index
-    idx = {}
-    if PLAYLISTS_DIR.exists():
-        for sub in PLAYLISTS_DIR.rglob("*"):
-            if sub.is_file():
-                idx[sub.name] = sub
-    with _file_index_lock:
+        idx = {}
+        if PLAYLISTS_DIR.exists():
+            for sub in PLAYLISTS_DIR.rglob("*"):
+                if sub.is_file() and sub.suffix.lower() in _LOCAL_MEDIA_EXTENSIONS:
+                    idx[sub.name] = sub
+                    canonical = _indexed_media_key(sub)
+                    idx.setdefault(canonical, sub)
         _file_index = idx
-        _file_index_ts = now
-    return idx
+        _file_index_ts = time.time()
+        return idx
 
 def _invalidate_file_index():
     global _file_index, _file_index_ts
     with _file_index_lock:
         _file_index = {}
         _file_index_ts = 0.0
+
+
+def _resolve_local_audio(tid: str, index=None):
+    """Resolve a track id to a non-empty local audio file and its storage tier."""
+    tid = str(tid or "").strip()
+    if not tid or not _SAFE_FILENAME_RE.fullmatch(tid):
+        return None, None
+    for ext in _LOCAL_AUDIO_EXTENSIONS:
+        candidate = SAVED_DIR / f"{tid}{ext}"
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate, "saved"
+        except OSError:
+            continue
+    media_index = index if index is not None else _get_file_index()
+    for ext in _LOCAL_AUDIO_EXTENSIONS:
+        candidate = media_index.get(f"{tid}{ext}")
+        try:
+            if candidate and candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate, "library"
+        except OSError:
+            continue
+    return None, None
+
+
+def _resolve_local_art(tid: str, index=None):
+    tid = str(tid or "").strip()
+    if not tid or not _SAFE_FILENAME_RE.fullmatch(tid):
+        return None, None
+    candidate = SAVED_DIR / f"{tid}.jpg"
+    try:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate, "saved"
+    except OSError:
+        pass
+    media_index = index if index is not None else _get_file_index()
+    candidate = media_index.get(f"{tid}.jpg")
+    try:
+        if candidate and candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate, "library"
+    except OSError:
+        pass
+    return None, None
+
+
+def _local_media_payload(tid: str, index=None) -> dict:
+    audio, audio_source = _resolve_local_audio(tid, index=index)
+    art, art_source = _resolve_local_art(tid, index=index)
+    payload = {
+        "local_audio": bool(audio),
+        "local_art": bool(art),
+        "audio_source": audio_source,
+        "art_source": art_source,
+    }
+    if audio:
+        endpoint = "local_file" if audio_source == "saved" else "library_file"
+        payload["url"] = f"/api/{endpoint}?q={urllib.parse.quote(audio.name)}"
+        payload["format"] = audio.suffix.lower().lstrip(".")
+    return payload
 
 # ── Community discover cache ──────────────────────────────────────────────────
 COMMUNITY_CACHE_JSON = SAVED_DIR / "community_cache.json"
@@ -874,8 +1094,74 @@ _downloads_status_cache = None
 _downloads_status_cache_ts = 0.0
 _DOWNLOADS_STATUS_CACHE_TTL = 3.0
 
-# ── Auth state cache (avoids _yt_headers_file.stat() per request) ────────────
-_auth_state_ok = _yt_headers_file.exists() and _yt_headers_file.stat().st_size > 10
+
+def _invalidate_downloads_status_cache():
+    global _downloads_status_cache, _downloads_status_cache_ts
+    _downloads_status_cache = None
+    _downloads_status_cache_ts = 0.0
+
+# ── Auth state cache (avoids auth-file stat calls per request) ────────────────
+def _load_youtube_oauth_credentials() -> dict:
+    client_id = os.environ.get("AKI_YOUTUBE_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("AKI_YOUTUBE_OAUTH_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        return {"client_id": client_id, "client_secret": client_secret}
+    try:
+        saved = json.loads(_yt_oauth_credentials_file.read_text(encoding="utf-8"))
+        client_id = str(saved.get("client_id") or "").strip()
+        client_secret = str(saved.get("client_secret") or "").strip()
+        if client_id and client_secret:
+            return {"client_id": client_id, "client_secret": client_secret}
+    except Exception:
+        pass
+    return {}
+
+
+def _ytmusic_player_audio_url(video_id: str) -> str:
+    """Return the best direct audio URL already exposed by YTMusic's player API.
+
+    Android's local OAuth-backed YTMusic client can often provide streamingData
+    without starting yt-dlp's JavaScript extraction path. Only explicit audio
+    formats with a direct URL are accepted; ciphered or unplayable responses
+    fall through to the established yt-dlp resolver.
+    """
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        return ""
+    try:
+        payload = ytmusic.get_song(video_id) or {}
+        status = (payload.get("playabilityStatus") or {}).get("status")
+        if status and status != "OK":
+            return ""
+        streaming = payload.get("streamingData") or {}
+        formats = list(streaming.get("adaptiveFormats") or []) + list(streaming.get("formats") or [])
+        audio = []
+        for item in formats:
+            mime = str(item.get("mimeType") or "").lower()
+            url = str(item.get("url") or "")
+            if url.startswith("https://") and mime.startswith("audio/"):
+                audio.append(item)
+        if not audio:
+            return ""
+        best = max(audio, key=lambda item: (
+            3 if "audio/mp4" in str(item.get("mimeType") or "").lower() else
+            2 if "audio/webm" in str(item.get("mimeType") or "").lower() else 1,
+            int(item.get("bitrate") or 0),
+        ))
+        return str(best.get("url") or "")
+    except Exception as exc:
+        log.debug("YTMusic direct player stream unavailable for %s: %s", video_id, exc)
+        return ""
+
+
+def _has_youtube_oauth_state() -> bool:
+    try:
+        return _yt_oauth_file.is_file() and _yt_oauth_file.stat().st_size > 20 and bool(_load_youtube_oauth_credentials())
+    except OSError:
+        return False
+
+
+_auth_state_ok = _has_youtube_oauth_state() or (_yt_headers_file.exists() and _yt_headers_file.stat().st_size > 10)
 
 SETTINGS_JSON = BASE_DIR / "settings.json"
 
@@ -912,10 +1198,27 @@ def _init_ytmusic():
     """Initialize YTMusic with auth headers if available, otherwise unauthenticated.
     Uses a requests.Session with cookies loaded from cookies.txt for proper domain matching.
     This avoids sending .google.com domain cookies to music.youtube.com (which rejects them)."""
+    oauth_credentials = _load_youtube_oauth_credentials()
+    if _has_youtube_oauth_state() and oauth_credentials:
+        try:
+            try:
+                from ytmusicapi.auth.oauth.credentials import OAuthCredentials
+            except ImportError:
+                from ytmusicapi import OAuthCredentials
+            ytm = YTMusic(
+                str(_yt_oauth_file),
+                oauth_credentials=OAuthCredentials(
+                    client_id=oauth_credentials["client_id"],
+                    client_secret=oauth_credentials["client_secret"],
+                ),
+            )
+            print("[INIT] YTMusic authenticated via local OAuth device token", flush=True)
+            return ytm
+        except Exception as e:
+            print(f"[INIT] YTMusic OAuth init failed ({e}), trying browser auth", flush=True)
     if has_valid_auth_state():
         try:
-            import requests as _req
-            session = _req.Session()
+            session = _BoundedRequestsSession()
             cookie_file = _resolve_cookie_file()
             if cookie_file:
                 _load_cookies_to_session(session, cookie_file.read_text(encoding="utf-8"))
@@ -960,16 +1263,27 @@ def _rebuild_ytmusic_auth():
     if cookie_file:
         print(f"[AUTH] Rebuild: reading cookies from {cookie_file} ({cookie_file.stat().st_size} bytes)", flush=True)
         try:
-            _generate_auth_headers(cookie_file.read_text(encoding="utf-8"))
+            cookie_text = cookie_file.read_text(encoding="utf-8")
+            _generate_auth_headers(cookie_text)
+            # Also save to ytmusic_auth.json for Tauri bridge auth status check
+            try:
+                import json as _json
+                headers = _json.loads(_yt_headers_file.read_text(encoding="utf-8"))
+                yauth.save_auth(headers)
+                print("[AUTH] Rebuild: saved auth to ytmusic_auth.json", flush=True)
+            except Exception as e:
+                print(f"[AUTH] Rebuild: failed to save ytmusic_auth.json: {e}", flush=True)
         except Exception as e:
             print(f"[AUTH] Rebuild: _generate_auth_headers failed: {e}", flush=True)
     else:
         print("[AUTH] Rebuild: no cookie file found", flush=True)
     # Update _auth_state_ok BEFORE calling _init_ytmusic() so the
     # has_valid_auth_state() check inside _init_ytmusic sees the current state.
-    _auth_state_ok = _yt_headers_file.exists() and _yt_headers_file.stat().st_size > 10
+    _auth_state_ok = _has_youtube_oauth_state() or (_yt_headers_file.exists() and _yt_headers_file.stat().st_size > 10)
     print(f"[AUTH] Rebuild: _auth_state_ok={_auth_state_ok}", flush=True)
     ytmusic = _init_ytmusic()
+    with _liked_lock:
+        _liked_cache.clear()
     _invalidate_stream_cache()
     return _auth_state_ok
 
@@ -978,16 +1292,267 @@ def _rebuild_ytmusic_auth():
 def get_track_id(name, artist):
     return hashlib.md5(f"{str(name).strip()}_{str(artist).strip()}".lower().encode()).hexdigest()
 
+
+_TRACK_VERSION_PATTERNS = OrderedDict((
+    ("live", re.compile(r"\blive\b|\bin concert\b", re.I)),
+    ("acoustic", re.compile(r"\bacoustic\b|\bunplugged\b", re.I)),
+    ("remix", re.compile(r"\bremix(?:ed)?\b|\bclub mix\b|\bdance mix\b", re.I)),
+    ("remaster", re.compile(r"\bremaster(?:ed)?\b(?:\s*\d{2,4})?", re.I)),
+    ("instrumental", re.compile(r"\binstrumental\b|\bkaraoke\b|\bminus one\b", re.I)),
+    ("cover", re.compile(r"\bcover\b|\btribute\b", re.I)),
+    ("demo", re.compile(r"\bdemo\b|\brough mix\b", re.I)),
+    ("sped-up", re.compile(r"\bsped[ -]?up\b|\bnightcore\b", re.I)),
+    ("slowed", re.compile(r"\bslowed\b|\bslowed\s*(?:and|&)\s*reverb\b", re.I)),
+    ("edit", re.compile(r"\bradio edit\b|\bsingle edit\b|\bshort edit\b", re.I)),
+))
+_IDENTITY_NOISE_RE = re.compile(
+    r"\b(?:official\s+)?(?:music\s+)?video\b|\bofficial audio\b|\blyric(?:s)?(?: video)?\b|\bvisuali[sz]er\b",
+    re.I,
+)
+_FEATURE_CREDIT_RE = re.compile(r"\s+(?:feat(?:uring)?|ft)\.?\s+.+$", re.I)
+
+
+def _coerce_duration_seconds(value) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+    text = str(value).strip()
+    try:
+        if ":" not in text:
+            return float(text)
+        parts = [float(part) for part in text.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _normalize_identity_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = text.replace("&", " and ").replace(" - topic", " ")
+    text = _IDENTITY_NOISE_RE.sub(" ", text)
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def _track_version_profile(title: str) -> dict:
+    raw = unicodedata.normalize("NFKC", str(title or ""))
+    # Version words are meaningful in qualifiers, not necessarily in the song's
+    # actual name ("Live Forever", "Cover Me"). Prefer bracketed and dash/colon
+    # suffixes so those ordinary titles do not become false live/cover matches.
+    bracketed = list(re.finditer(r"[\(\[\{]([^\)\]\}]+)[\)\]\}]", raw))
+    suffix = re.search(r"\s+[\-–—:]\s+(.+)$", raw)
+    qualifier_parts = [match.group(1) for match in bracketed]
+    if suffix:
+        qualifier_parts.append(suffix.group(1))
+    qualifier_text = " | ".join(qualifier_parts)
+    tags = {name for name, pattern in _TRACK_VERSION_PATTERNS.items() if pattern.search(qualifier_text)}
+    base = raw
+    for match in reversed(bracketed):
+        inner = match.group(1)
+        if any(pattern.search(inner) for pattern in _TRACK_VERSION_PATTERNS.values()):
+            base = base[:match.start()] + " " + base[match.end():]
+    if suffix and any(pattern.search(suffix.group(1)) for pattern in _TRACK_VERSION_PATTERNS.values()):
+        base = base[:suffix.start()]
+    base = _IDENTITY_NOISE_RE.sub(" ", base)
+    base = _FEATURE_CREDIT_RE.sub("", base)
+    base = re.sub(r"[\(\[\{]\s*[\-–—,:/]*\s*[\)\]\}]", " ", base)
+    base = re.sub(r"\s+[\-–—]\s*$", " ", base)
+    return {"base": _normalize_identity_text(base), "tags": tags}
+
+
+def _identity_similarity(left: str, right: str) -> float:
+    a = _normalize_identity_text(left)
+    b = _normalize_identity_text(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    seq = SequenceMatcher(None, a, b).ratio()
+    aset, bset = set(a.split()), set(b.split())
+    token = len(aset & bset) / max(1, len(aset | bset))
+    containment = min(len(aset & bset) / max(1, len(aset)), len(aset & bset) / max(1, len(bset)))
+    return max(seq, token * 0.75 + containment * 0.25)
+
+
+def _artist_identity_compatible(target_artist: str, candidate_artist: str) -> bool:
+    """Require a real artist-name relationship, not merely a good song title.
+
+    YouTube cover uploads often repeat the original artist in the video title,
+    which can produce an excellent combined score even when the credited artist
+    is unrelated. Artist compatibility is therefore a hard gate. Extra credited
+    collaborators are allowed, but cover/karaoke/tribute labels are not.
+    """
+    target_raw = _FEATURE_CREDIT_RE.sub("", str(target_artist or ""))
+    candidate_raw = _FEATURE_CREDIT_RE.sub("", str(candidate_artist or ""))
+    target = _normalize_identity_text(target_raw)
+    candidate = _normalize_identity_text(candidate_raw)
+    if not target or not candidate:
+        return False
+    if target == candidate:
+        return True
+    # YTMusic returns all credited artists joined by commas. An exact target
+    # credit inside that list is safe even when the complete joined string has
+    # low edit similarity (for example "Gorillaz, De La Soul").
+    candidate_credits = {
+        _normalize_identity_text(part)
+        for part in re.split(r"\s*,\s*", candidate_raw)
+        if _normalize_identity_text(part)
+    }
+    if target in candidate_credits:
+        return True
+    target_words = set(target.split())
+    candidate_words = set(candidate.split())
+    if (candidate_words - target_words) & {"cover", "covers", "karaoke", "tribute", "impersonator"}:
+        return False
+    common = target_words & candidate_words
+    if not common:
+        return False
+    shorter_coverage = len(common) / max(1, min(len(target_words), len(candidate_words)))
+    return shorter_coverage >= 0.8 and _identity_similarity(target, candidate) >= 0.62
+
+
+def _score_track_candidate(target: dict, candidate: dict) -> dict:
+    """Score candidate identity while explicitly penalizing version drift."""
+    target_profile = _track_version_profile(target.get("title") or target.get("name") or "")
+    candidate_profile = _track_version_profile(candidate.get("title") or candidate.get("name") or candidate.get("trackName") or "")
+    title_sim = _identity_similarity(target_profile["base"], candidate_profile["base"])
+    artist_sim = _identity_similarity(
+        _FEATURE_CREDIT_RE.sub("", str(target.get("artist") or target.get("artistName") or "")),
+        _FEATURE_CREDIT_RE.sub("", str(candidate.get("artist") or candidate.get("artistName") or "")),
+    )
+    artist_compatible = _artist_identity_compatible(
+        target.get("artist") or target.get("artistName") or "",
+        candidate.get("artist") or candidate.get("artistName") or "",
+    )
+    album_sim = _identity_similarity(target.get("album") or "", candidate.get("album") or candidate.get("albumName") or "")
+    target_album_id = str(target.get("albumId") or target.get("album_id") or "").strip()
+    candidate_album_id = str(candidate.get("albumId") or candidate.get("album_id") or "").strip()
+    target_duration = _coerce_duration_seconds(target.get("duration") or target.get("dur"))
+    candidate_duration = _coerce_duration_seconds(candidate.get("duration") or candidate.get("dur"))
+    duration_delta = abs(target_duration - candidate_duration) if target_duration is not None and candidate_duration is not None else None
+    missing_tags = target_profile["tags"] - candidate_profile["tags"]
+    unexpected_tags = candidate_profile["tags"] - target_profile["tags"]
+
+    score = title_sim * 55 + artist_sim * 25
+    if target_profile["tags"] == candidate_profile["tags"]:
+        score += 10
+    score -= len(missing_tags) * 17
+    score -= len(unexpected_tags) * 22
+    if album_sim:
+        score += album_sim * 5
+    if target_album_id and candidate_album_id:
+        score += 10 if target_album_id == candidate_album_id else -4
+    video_type = str(candidate.get("videoType") or "").upper()
+    if video_type.endswith("_ATV"):
+        score += 7  # canonical YouTube Music album audio
+    elif video_type.endswith("_OMV"):
+        score += 1  # official video; may contain a different intro/outro
+    if duration_delta is not None:
+        if duration_delta <= 2:
+            score += 18
+        elif duration_delta <= 5:
+            score += 14
+        elif duration_delta <= 12:
+            score += 7
+        elif duration_delta > 30:
+            score -= 22
+        elif duration_delta > 20:
+            score -= 12
+
+    material_versions = {"live", "acoustic", "remix", "instrumental", "cover", "demo", "sped-up", "slowed", "edit"}
+    hard_conflict = bool((unexpected_tags | missing_tags) & material_versions)
+    acceptable = title_sim >= 0.68 and artist_compatible and score >= 62 and not hard_conflict
+    return {
+        "score": round(score, 2),
+        "acceptable": acceptable,
+        "titleSimilarity": round(title_sim, 3),
+        "artistSimilarity": round(artist_sim, 3),
+        "artistCompatible": artist_compatible,
+        "durationDelta": round(duration_delta, 2) if duration_delta is not None else None,
+        "missingVersions": sorted(missing_tags),
+        "unexpectedVersions": sorted(unexpected_tags),
+    }
+
+
+def _rank_track_candidates(target: dict, candidates: list, minimum: float = 62) -> list:
+    ranked = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        match = _score_track_candidate(target, candidate)
+        if match["acceptable"] and match["score"] >= minimum:
+            enriched = dict(candidate)
+            enriched["_match"] = match
+            ranked.append(enriched)
+    ranked.sort(key=lambda item: item["_match"]["score"], reverse=True)
+    return ranked
+
+
+def _lyrics_identity_signature(title: str, artist: str, duration=None) -> str:
+    profile = _track_version_profile(title)
+    dur = _coerce_duration_seconds(duration)
+    identity = "|".join((profile["base"], ",".join(sorted(profile["tags"])), _normalize_identity_text(artist), str(round(dur or 0))))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def _recording_identity_signature(title: str, artist: str, duration=None,
+                                  album: str = "", album_id: str = "") -> str:
+    """Stable key for a recording choice; unlike a stream URL it survives restarts."""
+    profile = _track_version_profile(title)
+    dur = _coerce_duration_seconds(duration)
+    identity = "|".join((
+        profile["base"],
+        ",".join(sorted(profile["tags"])),
+        _normalize_identity_text(artist),
+        str(round(dur or 0)),
+        _normalize_identity_text(album),
+        str(album_id or "").strip(),
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _art_source_hint(url: str) -> str:
+    lower = str(url or "").lower()
+    if lower.startswith(("/api/", "/static/", "app:")):
+        return "local"
+    if "mzstatic.com" in lower or "itunes.apple.com" in lower:
+        return "apple"
+    if "i.scdn.co" in lower or "scdn.co" in lower:
+        return "spotify"
+    if "ytimg.com" in lower or "googleusercontent.com" in lower or "img.youtube.com" in lower:
+        return "youtube"
+    return "provider" if lower else ""
+
 def _build_track_dict(name, artist, art, dur, tid, videoId, albumId="", **extra):
+    local_audio, _audio_source = _resolve_local_audio(tid)
+    local_art, _art_source = _resolve_local_art(tid)
     d = {
         "name": name, "artist": artist,
         "art": art, "dur": dur, "tid": tid,
         "videoId": videoId,
         "albumId": albumId or "",
-        "local_audio": (SAVED_DIR / f"{tid}.mp3").exists(),
-        "local_art": (SAVED_DIR / f"{tid}.jpg").exists(),
+        "local_audio": bool(local_audio),
+        "local_art": bool(local_art),
     }
     d.update(extra)
+    candidates = d.get("art_candidates") if isinstance(d.get("art_candidates"), list) else []
+    candidates = [str(url) for url in candidates if url]
+    if art:
+        candidates.insert(0, art)
+    if videoId:
+        candidates.append(f"https://i.ytimg.com/vi/{videoId}/maxresdefault.jpg")
+        candidates.append(f"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg")
+    d["art_candidates"] = list(dict.fromkeys(candidates))[:6]
+    # Update art to the best available candidate (highest‑resolution, first in list)
+    if d["art_candidates"] and d["art_candidates"][0] != d["art"]:
+        d["art"] = d["art_candidates"][0]
+    d.setdefault("art_source", _art_source_hint(art))
     return d
 
 def _load_favorites():
@@ -1015,21 +1580,61 @@ def itunes_search(query: str, limit: int = 15) -> list:
     if not query.strip(): return []
     try:
         url = "https://itunes.apple.com/search"
-        params = {"term": query, "entity": "song", "limit": limit, "country": "JP"}
+        # The old JP storefront default localized otherwise-English releases and
+        # could return an artist identity which no longer matched the recording
+        # resolver. Use the US English catalogue as the neutral default, then
+        # rank exact title/artist text ahead of Apple's broader popularity order.
+        params = {
+            "term": query,
+            "media": "music",
+            "entity": "song",
+            "limit": limit,
+            "country": "US",
+            "lang": "en_us",
+        }
         resp = _itunes_session.get(url, params=params, timeout=10)
         resp.raise_for_status()
         results = []
-        for item in resp.json().get("results", []):
+        query_text = _normalize_identity_text(query)
+        query_words = set(query_text.split())
+        for provider_index, item in enumerate(resp.json().get("results", [])):
             name = item.get("trackName", "Unknown Track")
             artist = item.get("artistName", "Unknown Artist")
             art = item.get("artworkUrl100", "")
             tid = get_track_id(name, artist)
+            title_text = _normalize_identity_text(name)
+            artist_text = _normalize_identity_text(artist)
+            searchable_words = set(f"{title_text} {artist_text}".split())
+            matched_words = len(query_words & searchable_words)
+            score = matched_words * 18
+            if query_text == title_text:
+                score += 120
+            elif title_text.startswith(query_text):
+                score += 75
+            elif query_text and query_text in title_text:
+                score += 45
+            if query_words and query_words.issubset(searchable_words):
+                score += 35
+            # For an ASCII/English query, gently prefer readable Latin metadata.
+            # This is a tie-breaker rather than a filter, so international songs
+            # and artists remain available when the user searches for them.
+            if query.isascii():
+                letters = [char for char in artist if char.isalpha()]
+                latin_letters = [char for char in letters if "LATIN" in unicodedata.name(char, "")]
+                if letters:
+                    score += 12 * (len(latin_letters) / len(letters))
             results.append({
                 "name": name, "artist": artist,
                 "art": art.replace("100x100bb.jpg", "600x600bb.jpg"),
                 "dur": int(item.get("trackTimeMillis", 210000) / 1000),
-                "tid": tid
+                "tid": tid,
+                "_search_score": score,
+                "_provider_index": provider_index,
             })
+        results.sort(key=lambda item: (-item["_search_score"], item["_provider_index"]))
+        for item in results:
+            item.pop("_search_score", None)
+            item.pop("_provider_index", None)
         return results
     except Exception as e:
         log.warning(f"Search Error: {e}")
@@ -1045,47 +1650,311 @@ def _record_download_status(tid: str, ok: bool, error: str = None):
                 if _download_status:
                     _download_status.popitem(last=False)
         _download_status[tid] = {"ok": ok, "error": error}
+    _invalidate_downloads_status_cache()
+
+def _download_source_for_track(track: dict) -> tuple[str, str]:
+    """Resolve one recording-accurate YouTube source for an offline download."""
+    vid = str(track.get("videoId") or "").strip()
+    if not vid:
+        resolved = resolve_recording(
+            track.get("name") or track.get("title") or "",
+            track.get("artist") or track.get("artist_name") or "",
+            track.get("dur") or track.get("duration"),
+            track.get("album") or track.get("albumName") or "",
+            track.get("albumId") or "",
+        )
+        vid = str((resolved or {}).get("videoId") or "")
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}", vid
+    raise LookupError(
+        f"No exact recording found for {track.get('artist', '')} - {track.get('name', '')}"
+    )
+
+
+def _artwork_urls_for_track(track: dict, resolve_missing: bool = False) -> list[str]:
+    """Return one deduplicated, resolver-ranked URL list for all download paths."""
+    source = dict(track or {})
+    candidates = source.get("art_candidates") if isinstance(source.get("art_candidates"), list) else []
+    urls = []
+    for item in candidates:
+        urls.append(item.get("url", "") if isinstance(item, dict) else item)
+    urls.extend((source.get("album_art", ""), source.get("art", ""), source.get("thumbnail", "")))
+    if resolve_missing and len([url for url in urls if url]) < 2:
+        try:
+            resolved = _ensure_artwork_fetcher().resolve_artwork(source)
+            ranked = resolved.get("art_candidates") if isinstance(resolved.get("art_candidates"), list) else []
+            urls = list(ranked) + [resolved.get("album_art", ""), resolved.get("art", "")] + urls
+        except Exception as exc:
+            log.debug("Artwork resolution before download failed: %s", exc)
+    return list(dict.fromkeys(
+        str(url).strip() for url in urls
+        if isinstance(url, str) and url.strip().startswith(("https://", "http://"))
+    ))[:6]
+
+
+def _is_raster_art(content: bytes, content_type: str = "") -> bool:
+    """Reject error pages and SVG/script payloads before caching as local art."""
+    if "svg" in str(content_type).lower() or not content or len(content) < 128:
+        return False
+    head = content[:32]
+    return (
+        head.startswith(b"\xff\xd8\xff") or head.startswith(b"\x89PNG\r\n\x1a\n") or
+        head.startswith((b"GIF87a", b"GIF89a")) or
+        (head.startswith(b"RIFF") and head[8:12] == b"WEBP") or
+        (len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis", b"heic", b"heix"))
+    )
+
+
+def _download_first_artwork(candidates: list[str]) -> tuple[bytes | None, str]:
+    """Fetch the first valid distinct candidate once, bounded to 8 MiB."""
+    for url in list(dict.fromkeys(candidates or []))[:4]:
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            continue
+        try:
+            if _is_private_or_link_local(url):
+                continue
+            headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*", "Referer": url}
+            response = (_curl.get(url, timeout=8, headers=headers, stream=True) if _curl is not None else
+                        requests.get(url, timeout=8, allow_redirects=True, headers=headers, stream=True))
+            try:
+                if response.status_code != 200:
+                    continue
+                chunks, total = [], 0
+                for chunk in response.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > 8 * 1024 * 1024:
+                        chunks = []
+                        break
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                if _is_raster_art(content, response.headers.get("Content-Type", "")):
+                    return content, url
+            finally:
+                response.close()
+        except Exception:
+            continue
+    return None, ""
+
+
+def _android_stream_extension(content_type: str, url: str) -> str:
+    """Map a resolved audio response to a WebView-compatible local suffix."""
+    value = urllib.parse.unquote(f"{content_type} {url}").lower()
+    if "webm" in value:
+        return ".webm"
+    if "opus" in value or "audio/ogg" in value:
+        return ".opus"
+    return ".m4a"
+
+
+def _download_android_resolved_audio(track: dict, target_dir: Path, stem: str) -> tuple[Path, str]:
+    """Download through the same accurate resolver used by foreground playback.
+
+    This avoids a second independent yt-dlp extraction in Chaquopy, joins any
+    in-flight playback resolution, and refreshes a stale signed URL internally.
+    """
+    title = str(track.get("name") or track.get("title") or "").strip()
+    artist = str(track.get("artist") or track.get("artist_name") or "").strip()
+    tid = str(track.get("tid") or get_track_id(title, artist))
+    query = f"{artist} {title} audio".strip()
+    last_error = "No playable stream was resolved"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    partial = target_dir / f".{stem}.{threading.get_ident()}.audio.part"
+    partial_suffix = ""
+
+    try:
+        for force in (False, True):
+            result = resolve_stream_singleflight(
+                query, tid, str(track.get("videoId") or ""), force=force,
+                title=title, artist=artist,
+                duration=track.get("dur") or track.get("duration"),
+                album=track.get("album") or track.get("albumName") or "",
+                album_id=track.get("albumId") or "",
+            )
+            url = str((result or {}).get("url") or "")
+            if not url:
+                last_error = str((result or {}).get("error") or last_error)
+                continue
+
+            # Two transport attempts preserve already-written bytes. If the
+            # signed URL itself has expired, the outer forced resolution obtains
+            # a fresh URL and resumes the same partial file with a Range request.
+            for transport_attempt in range(2):
+                response = None
+                try:
+                    offset = partial.stat().st_size if partial.exists() else 0
+                    headers = {
+                        "User-Agent": _YDL_USER_AGENT,
+                        "Referer": "https://www.youtube.com/",
+                        "Origin": "https://www.youtube.com",
+                        "Accept-Encoding": "identity",
+                        "Range": f"bytes={offset}-",
+                    }
+                    session = _stream_curl if _stream_curl is not None else _fallback_proxy_session
+                    response = session.get(url, headers=headers, timeout=30, stream=True)
+                    if response.status_code not in (200, 206):
+                        last_error = f"Media host returned HTTP {response.status_code}"
+                        if response.status_code in (403, 410):
+                            break
+                        continue
+                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+                    if content_type and not (
+                        content_type.startswith(("audio/", "video/")) or
+                        content_type in ("application/octet-stream", "binary/octet-stream")
+                    ):
+                        last_error = f"Media host returned {content_type}"
+                        break
+                    suffix = _android_stream_extension(content_type, url)
+                    if partial_suffix and partial_suffix != suffix and offset:
+                        partial.unlink(missing_ok=True)
+                        partial_suffix = suffix
+                        last_error = "Resolved audio format changed; restarting transfer"
+                        continue
+                    partial_suffix = suffix
+                    append = response.status_code == 206 and offset > 0
+                    if not append:
+                        offset = 0
+                    expected_total = 0
+                    content_range = str(response.headers.get("Content-Range") or "")
+                    range_total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
+                    if range_total.isdigit():
+                        expected_total = int(range_total)
+                    elif response.headers.get("Content-Length"):
+                        expected_total = offset + int(response.headers["Content-Length"])
+                    with open(partial, "ab" if append else "wb") as output:
+                        for chunk in response.iter_content(chunk_size=256 * 1024):
+                            if chunk:
+                                output.write(chunk)
+                    completed_size = partial.stat().st_size
+                    if completed_size < 16 * 1024:
+                        raise RuntimeError("Resolved media response was unexpectedly short")
+                    if expected_total and completed_size < expected_total:
+                        raise RuntimeError(f"Media transfer stopped at {completed_size} of {expected_total} bytes")
+                    destination = target_dir / f"{stem}{suffix}"
+                    os.replace(partial, destination)
+                    matched_vid = str((result or {}).get("matchedVideoId") or track.get("videoId") or "")
+                    return destination, matched_vid
+                except Exception as exc:
+                    last_error = str(exc)
+                finally:
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+        raise RuntimeError(last_error)
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+
 
 def download_track(track: dict) -> bool:
     tid = track.get('tid') or get_track_id(track['name'], track['artist'])
-    audio_path = SAVED_DIR / f"{tid}.mp3"
-    art_path = SAVED_DIR / f"{tid}.jpg"
-    if not art_path.exists() and track.get('art'):
-        art_url = track['art']
-        if art_url.startswith(('https://', 'http://')):
-            try:
-                r = requests.get(art_url, timeout=10, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
-                if r.ok: art_path.write_bytes(r.content)
-            except Exception as e:
-                log.warning(f"Art download failed for {tid}: {e}")
-    if not audio_path.exists():
-        vid = track.get('videoId', '')
-        if vid:
-            source = f"https://www.youtube.com/watch?v={vid}"
-        else:
-            source = f"ytsearch1:{track['artist']} {track['name']} audio"
-        ydl_opts = {
-            'format': 'bestaudio/best', 'outtmpl': str(SAVED_DIR / tid),
-            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
-            **_YDL_COMMON_OPTS,
-            "http_headers": {"User-Agent": _YDL_USER_AGENT},
-            **_ydl_extras(),
-        }
+    audio_path, _storage_tier = _resolve_local_audio(tid)
+    if not audio_path:
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([source])
-            for f in SAVED_DIR.glob(f"{tid}*"):
-                if f.suffix == ".mp3":
-                    if f.name != f"{tid}.mp3": f.rename(audio_path)
-                    break
-                elif f.suffix in [".m4a", ".webm", ".opus"]: f.rename(audio_path); break
+            if IS_ANDROID:
+                _downloaded, _resolved_vid = _download_android_resolved_audio(
+                    dict(track, tid=tid), SAVED_DIR, tid,
+                )
+            else:
+                source, _resolved_vid = _download_source_for_track(track)
+                ydl_opts = {
+                    'format': 'bestaudio/best', 'outtmpl': str(SAVED_DIR / tid),
+                    'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
+                    **_YDL_DOWNLOAD_OPTS,
+                    "http_headers": {"User-Agent": _YDL_USER_AGENT},
+                    **_ydl_extras(),
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([source])
+                desktop_audio_path = SAVED_DIR / f"{tid}.mp3"
+                for f in SAVED_DIR.glob(f"{tid}*"):
+                    if f.suffix == ".mp3":
+                        if f.name != f"{tid}.mp3": f.rename(desktop_audio_path)
+                        break
+                    elif f.suffix in [".m4a", ".webm", ".opus"]:
+                        f.rename(desktop_audio_path)
+                        break
+            audio_path, _storage_tier = _resolve_local_audio(tid)
+            if not audio_path:
+                raise RuntimeError("Download completed without a playable audio file")
         except Exception as e:
             log.warning(f"Download failed for {tid}: {e}")
             _record_download_status(tid, False, str(e))
             return False
+    # Audio availability is the critical path. Artwork is intentionally fetched
+    # afterwards, and failure to cache art never discards playable local audio.
+    art_path = SAVED_DIR / f"{tid}.jpg"
+    if not art_path.exists():
+        try:
+            art_bytes, _working_url = _download_first_artwork(
+                _artwork_urls_for_track(track, resolve_missing=True)
+            )
+            if art_bytes:
+                tmp_art = art_path.with_suffix(".jpg.tmp")
+                tmp_art.write_bytes(art_bytes)
+                os.replace(tmp_art, art_path)
+        except Exception as exc:
+            log.debug("Offline artwork cache failed for %s: %s", tid, exc)
     _record_download_status(tid, True)
     return True
 
-def get_stream_url(query: str, tid: str = "", vid: str = "", force: bool = False) -> dict:
+
+_favorite_downloads_pending = set()
+_favorite_downloads_pending_lock = threading.Lock()
+
+
+def _download_favorite_once(track: dict):
+    tid = track.get('tid') or get_track_id(track.get('name', ''), track.get('artist', ''))
+    try:
+        return download_track(track)
+    finally:
+        with _favorite_downloads_pending_lock:
+            _favorite_downloads_pending.discard(tid)
+
+
+def _enqueue_favorite_download(track: dict) -> bool:
+    tid = track.get('tid') or get_track_id(track.get('name', ''), track.get('artist', ''))
+    if not tid or _resolve_local_audio(tid)[0]:
+        return False
+    with _favorite_downloads_pending_lock:
+        if tid in _favorite_downloads_pending:
+            return False
+        _favorite_downloads_pending.add(tid)
+    with _download_status_lock:
+        _download_status[tid] = {"ok": None, "error": None, "pending": True}
+    _invalidate_downloads_status_cache()
+    try:
+        _download_executor.submit(_download_favorite_once, dict(track, tid=tid))
+    except Exception:
+        with _favorite_downloads_pending_lock:
+            _favorite_downloads_pending.discard(tid)
+        raise
+    return True
+
+def get_stream_url(query: str, tid: str = "", vid: str = "", force: bool = False,
+                   title: str = "", artist: str = "", duration=None,
+                   album: str = "", album_id: str = "") -> dict:
+    """Single-pass stream URL resolution.
+
+    Flow:
+    1. Check stream cache (tid + recording identity)
+    2. Determine target videoId:
+       - Explicit vid parameter
+       - resolve_recording(title, artist, ...) for metadata-based lookup
+       - Fallback: ytsearch1:query
+    3. Try YTMusic direct player URL (fast path, skipped if force=True)
+    4. ONE yt-dlp extraction for the determined videoId
+    5. Cache and return
+    """
+    recording_identity = _recording_identity_signature(title, artist, duration, album, album_id) if title and artist else ""
+    requested_identity = recording_identity
+
+    # 1. Stream cache lookup
     if tid and not force:
         with _stream_cache_lock:
             if tid in _stream_cache:
@@ -1093,85 +1962,205 @@ def get_stream_url(query: str, tid: str = "", vid: str = "", force: bool = False
                 entry = cached if isinstance(cached, dict) else {"url": cached}
                 exp = entry.get("exp") or 0
                 url = entry["url"]
-                # Evict expired entries inline rather than serving stale URLs.
-                if exp and exp <= time.time():
+                if (requested_identity and entry.get("identity") != requested_identity) or (exp and exp <= time.time()):
                     _stream_cache.pop(tid, None)
                 else:
                     _stream_cache.move_to_end(tid)
-                    return {"url": url, "cached": True}
+                    result = {"url": url, "cached": True}
+                    for key in ("matchedVideoId", "matchConfidence", "recordingResolved"):
+                        if entry.get(key) is not None:
+                            result[key] = entry[key]
+                    return result
     elif tid and force:
-        # Eager-evict the entry being bypassed so the fresh URL re-extracted below
-        # isn't shadowed by the stale one for the duration of the request.
         with _stream_cache_lock:
             _stream_cache.pop(tid, None)
 
     _YDL_HTTP_HEADERS = {"User-Agent": _YDL_USER_AGENT}
 
-    def _extract_url(source):
-        formats_to_try = [
-            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "bestaudio/best",
-            "best[ext=m4a]/best[ext=webm]/best",
-            "best",
-        ]
-        auth_fail_seen = False
-        for fmt in formats_to_try:
-            ydl_opts = {
-                "format": fmt,
-                **_YDL_EXTRACT_OPTS,
-                "http_headers": _YDL_HTTP_HEADERS,
-                **_ydl_extras(),
+    def _extract_url_for_vid(target_vid: str) -> tuple[str | None, bool]:
+        """Extract stream URL for a specific videoId. Returns (url, auth_fail_seen)."""
+        source = f"https://www.youtube.com/watch?v={target_vid}"
+
+        # Fast path: YTMusic direct player URL (try ALWAYS, even on force)
+        # force=True only bypasses cache, not the extraction method order
+        try:
+            direct_url = _ytmusic_player_audio_url(target_vid)
+        except NameError:
+            direct_url = ""
+        if direct_url:
+            return direct_url, False
+
+        # Single yt-dlp extraction - gets complete formats table in one pass
+        fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+        ydl_opts = {
+            "format": fmt,
+            **_YDL_EXTRACT_OPTS,
+            "http_headers": _YDL_HTTP_HEADERS,
+            **_ydl_extras(),
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(source, download=False)
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    if not entries:
+                        return None, False
+                    info = entries[0]
+                formats = info.get("formats", [])
+                audio = [f for f in formats if f.get("vcodec") == "none" and f.get("url")]
+                if not audio:
+                    audio = [f for f in formats if f.get("url")]
+                if not audio:
+                    return info.get("url"), False
+                best = max(audio, key=lambda f: ({"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))
+                return best["url"], False
+        except Exception as e:
+            msg = str(e)
+            auth_fail_seen = bool(_AUTH_FAIL_RE.search(msg))
+            if auth_fail_seen:
+                print(f"[AUTH_FAIL] vid={target_vid} err={msg[:120]}", flush=True)
+            return None, auth_fail_seen
+
+    # 2. Determine target videoId
+    target_vid = vid
+    match_result = {}
+
+    if not target_vid and title and artist:
+        # Use recording resolution to find the best matching videoId
+        resolved = resolve_recording(title, artist, duration, album, album_id, exclude_vid="", force=force)
+        if resolved and resolved.get("videoId"):
+            target_vid = resolved["videoId"]
+            match_result = {
+                "matchedVideoId": target_vid,
+                "matchConfidence": resolved.get("_match", {}).get("score") or resolved.get("confidence"),
+                "recordingResolved": True,
             }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(source, download=False)
-                    if "entries" in info:
-                        entries = [e for e in info["entries"] if e]
-                        if not entries:
-                            return (None, auth_fail_seen)
-                        info = entries[0]
-                    formats = info.get("formats", [])
-                    audio = [f for f in formats if f.get("vcodec") == "none" and f.get("url")]
-                    if not audio:
-                        audio = [f for f in formats if f.get("url")]
-                    if not audio:
-                        continue
-                    best = max(audio, key=lambda f: ({"m4a":3,"webm":2}.get(f.get("ext",""),0), f.get("tbr") or 0))
-                    return (best["url"], auth_fail_seen)
-            except Exception as e:
-                msg = str(e)
-                if _AUTH_FAIL_RE.search(msg):
-                    print(f"[AUTH_FAIL] source={source[:80]} fmt={fmt} err={msg[:120]}", flush=True)
-                    auth_fail_seen = True
-                continue
-        return (None, auth_fail_seen)
+            # Cache the recording resolution for future use
+            if recording_identity:
+                _cache_recording_resolution(recording_identity, resolved, source="search")
 
-    if vid:
-        url, auth_fail_seen = _extract_url(f"https://www.youtube.com/watch?v={vid}")
-        if url:
-            if not auth_fail_seen:
-                _cache_stream(tid, url)
-            return {"url": url}
-        print(f"[STREAM_URL] vid={vid} FAILED, falling back to ytsearch", flush=True)
-        url, auth_fail_seen = _extract_url(f"ytsearch1:{query}")
-        if url:
-            if not auth_fail_seen:
-                _cache_stream(tid, url)
-            return {"url": url}
-        print(f"[STREAM_URL] ALL FAILED for: {query[:50]}", flush=True)
-        return {"error": "Stream not available"}
+    if not target_vid:
+        # Fallback: search query (no metadata to resolve recording)
+        target_vid = None  # ytsearch will be used in extraction
 
-    if query.startswith("http"):
-        url, auth_fail_seen = _extract_url(query)
+    # 3. Extract stream URL
+    url = None
+    auth_fail_seen = False
+
+    if target_vid:
+        url, auth_fail_seen = _extract_url_for_vid(target_vid)
+        if not url and not force and title and artist:
+            # One fallback: try a fresh recording resolution (in case cached was stale)
+            print(f"[STREAM_URL] vid={target_vid} extraction failed, re-resolving recording", flush=True)
+            _invalidate_recording_resolution(recording_identity)
+            resolved = resolve_recording(title, artist, duration, album, album_id, exclude_vid=target_vid, force=True)
+            if resolved and resolved.get("videoId") and resolved["videoId"] != target_vid:
+                target_vid = resolved["videoId"]
+                match_result = {
+                    "matchedVideoId": target_vid,
+                    "matchConfidence": resolved.get("_match", {}).get("score") or resolved.get("confidence"),
+                    "recordingResolved": True,
+                }
+                if recording_identity:
+                    _cache_recording_resolution(recording_identity, resolved, source="search_fallback")
+                url, auth_fail_seen = _extract_url_for_vid(target_vid)
     else:
-        url, auth_fail_seen = _extract_url(f"ytsearch1:{query}")
+        # ytsearch fallback (no title/artist metadata)
+        source = f"ytsearch1:{query}"
+        fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+        ydl_opts = {
+            "format": fmt,
+            **_YDL_EXTRACT_OPTS,
+            "http_headers": _YDL_HTTP_HEADERS,
+            **_ydl_extras(),
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(source, download=False)
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    if entries:
+                        info = entries[0]
+                        target_vid = info.get("videoId", "")
+                        if target_vid and recording_identity:
+                            match_result = {
+                                "matchedVideoId": target_vid,
+                                "matchConfidence": 0,
+                                "recordingResolved": True,
+                            }
+                formats = info.get("formats", [])
+                audio = [f for f in formats if f.get("vcodec") == "none" and f.get("url")]
+                if not audio:
+                    audio = [f for f in formats if f.get("url")]
+                if audio:
+                    best = max(audio, key=lambda f: ({"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))
+                    url = best["url"]
+                else:
+                    url = info.get("url")
+        except Exception as e:
+            msg = str(e)
+            auth_fail_seen = bool(_AUTH_FAIL_RE.search(msg))
+            if auth_fail_seen:
+                print(f"[AUTH_FAIL] ytsearch err={msg[:120]}", flush=True)
 
     if url:
         if not auth_fail_seen:
-            _cache_stream(tid, url)
-        return {"url": url}
-    print(f"[STREAM_URL] ytsearch FAILED for: {query[:50]}", flush=True)
+            _cache_stream(tid, url, requested_identity, match_result)
+        return {"url": url, **match_result}
+
+    print(f"[STREAM_URL] ALL FAILED for: {query[:50]} (vid={target_vid})", flush=True)
     return {"error": "Stream not available"}
+
+
+def resolve_stream_singleflight(query: str, tid: str = "", vid: str = "", force: bool = False,
+                                title: str = "", artist: str = "", duration=None,
+                                album: str = "", album_id: str = "") -> dict:
+    """Share one expensive yt-dlp extraction between warming and playback.
+
+    A click that arrives while its search-result warmer is still running waits
+    on the same extraction instead of launching a second QuickJS/YouTube pass.
+    Forced stale-URL recovery deliberately bypasses this coordination.
+    """
+    if force:
+        return get_stream_url(
+            query, tid, vid, force=True, title=title, artist=artist,
+            duration=duration, album=album, album_id=album_id,
+        )
+    identity = (_recording_identity_signature(title, artist, duration, album, album_id)
+                if title and artist else "")
+    key = str((f"{tid}|{identity}" if tid and identity else tid or identity) or hashlib.sha256(
+        f"{query}|{vid}".encode("utf-8")
+    ).hexdigest()[:24])
+    owner = False
+    with _stream_resolution_lock:
+        entry = _stream_resolution_inflight.get(key)
+        if entry is None:
+            entry = {"event": threading.Event(), "result": None}
+            _stream_resolution_inflight[key] = entry
+            owner = True
+    if not owner:
+        if entry["event"].wait(timeout=30):
+            result = entry.get("result")
+            if isinstance(result, dict):
+                return dict(result)
+        # The owner exceeded the normal API timeout or terminated unexpectedly;
+        # preserve the established cold path as the final safety net.
+        return get_stream_url(
+            query, tid, vid, title=title, artist=artist,
+            duration=duration, album=album, album_id=album_id,
+        )
+    try:
+        result = get_stream_url(
+            query, tid, vid, title=title, artist=artist,
+            duration=duration, album=album, album_id=album_id,
+        )
+        entry["result"] = dict(result) if isinstance(result, dict) else result
+        return result
+    finally:
+        with _stream_resolution_lock:
+            if _stream_resolution_inflight.get(key) is entry:
+                _stream_resolution_inflight.pop(key, None)
+            entry["event"].set()
 
 def _clean_search_tokens(query: str) -> str:
     q = " ".join(query.split())
@@ -1190,6 +2179,215 @@ _STOP_WORDS = {"by", "feat", "ft", "and", "the", "a", "an", "of", "in", "on", "a
 def _tokenize_query(query: str) -> list:
     lower = re.sub(r'[^\w\s]', '', query.lower())
     return [w for w in lower.split() if w and w not in _STOP_WORDS]
+
+
+def _version_aware_yt_candidates(title: str, artist: str, duration=None,
+                                 exclude_vid: str = "", limit: int = 4,
+                                 album: str = "", album_id: str = "") -> list:
+    """Return only identity-safe YouTube Music song candidates, best first."""
+    target = {"title": title, "artist": artist, "duration": duration,
+              "album": album, "albumId": album_id}
+    query = " ".join(part for part in (artist, title) if part).strip()
+    if not query:
+        return []
+    try:
+        results = ytmusic.search(query, filter="songs", limit=20)
+    except Exception as exc:
+        log.debug(f"Version-aware YT search failed: {exc}")
+        return []
+    candidates = []
+    for item in results or []:
+        video_id = item.get("videoId", "")
+        if not video_id or video_id == exclude_vid:
+            continue
+        artists = item.get("artists") or []
+        thumbnails = item.get("thumbnails") or []
+        art = thumbnails[-1].get("url", "") if thumbnails and isinstance(thumbnails[-1], dict) else ""
+        candidates.append({
+            "title": item.get("title", ""),
+            "artist": ", ".join(a.get("name", "") for a in artists if a.get("name")),
+            "album": (item.get("album") or {}).get("name", ""),
+            "albumId": (item.get("album") or {}).get("id", ""),
+            "duration": item.get("duration_seconds") or item.get("duration"),
+            "videoId": video_id,
+            "videoType": item.get("videoType", ""),
+            "art": art,
+        })
+    return _rank_track_candidates(target, candidates, minimum=68)[:max(1, limit)]
+
+
+def _load_recording_resolutions_locked() -> OrderedDict:
+    global _recording_resolution_cache
+    if _recording_resolution_cache is not None:
+        return _recording_resolution_cache
+    entries = OrderedDict()
+    try:
+        if RECORDING_RESOLUTIONS_JSON.exists():
+            doc = json.loads(RECORDING_RESOLUTIONS_JSON.read_text(encoding="utf-8"))
+            if isinstance(doc, dict) and doc.get("schema") == _RECORDING_RESOLUTION_SCHEMA:
+                for key, value in (doc.get("entries") or {}).items():
+                    if isinstance(value, dict) and value.get("videoId"):
+                        entries[str(key)] = value
+    except Exception as exc:
+        log.warning(f"Recording resolution cache could not be loaded: {exc}")
+    _recording_resolution_cache = entries
+    return entries
+
+
+def _save_recording_resolutions_locked() -> None:
+    cache = _load_recording_resolutions_locked()
+    while len(cache) > _RECORDING_RESOLUTION_MAX:
+        cache.popitem(last=False)
+    _atomic_write_json(RECORDING_RESOLUTIONS_JSON, {
+        "schema": _RECORDING_RESOLUTION_SCHEMA,
+        "entries": cache,
+    })
+
+
+def _cached_recording_resolution(identity: str, exclude_vid: str = "", target: dict | None = None) -> dict | None:
+    if not identity:
+        return None
+    with _recording_resolution_lock:
+        cache = _load_recording_resolutions_locked()
+        entry = cache.get(identity)
+        if not entry:
+            return None
+        age = time.time() - float(entry.get("resolvedAt") or 0)
+        invalid_identity = bool(target) and entry.get("source") != "provided" and not _score_track_candidate(target, entry)["acceptable"]
+        if age > _RECORDING_RESOLUTION_TTL or entry.get("videoId") == exclude_vid or invalid_identity:
+            cache.pop(identity, None)
+            try:
+                _save_recording_resolutions_locked()
+            except Exception as exc:
+                log.debug("Invalid recording cache entry could not be removed: %s", exc)
+            return None
+        cache.move_to_end(identity)
+        return dict(entry)
+
+
+def _cache_recording_resolution(identity: str, candidate: dict, source: str = "search") -> None:
+    video_id = str((candidate or {}).get("videoId") or "").strip()
+    if not identity or not video_id:
+        return
+    match = (candidate or {}).get("_match") or {}
+    entry = {
+        "videoId": video_id,
+        "title": str((candidate or {}).get("title") or "")[:500],
+        "artist": str((candidate or {}).get("artist") or "")[:500],
+        "album": str((candidate or {}).get("album") or "")[:500],
+        "albumId": str((candidate or {}).get("albumId") or "")[:256],
+        "duration": _coerce_duration_seconds((candidate or {}).get("duration")),
+        "videoType": str((candidate or {}).get("videoType") or "")[:128],
+        "art": str((candidate or {}).get("art") or "")[:4096],
+        "confidence": float(match.get("score") or (100 if source == "provided" else 0)),
+        "source": source,
+        "resolvedAt": time.time(),
+    }
+    with _recording_resolution_lock:
+        cache = _load_recording_resolutions_locked()
+        existing = cache.get(identity) or {}
+        if (existing.get("videoId") == video_id
+                and time.time() - float(existing.get("resolvedAt") or 0) < 24 * 60 * 60):
+            cache.move_to_end(identity)
+            return
+        cache[identity] = entry
+        cache.move_to_end(identity)
+        try:
+            _save_recording_resolutions_locked()
+        except Exception as exc:
+            log.warning(f"Recording resolution cache could not be saved: {exc}")
+
+
+def _invalidate_recording_resolution(identity: str) -> None:
+    if not identity:
+        return
+    with _recording_resolution_lock:
+        cache = _load_recording_resolutions_locked()
+        if cache.pop(identity, None) is not None:
+            try:
+                _save_recording_resolutions_locked()
+            except Exception as exc:
+                log.warning(f"Recording resolution cache could not be updated: {exc}")
+
+
+def resolve_recording(title: str, artist: str, duration=None, album: str = "",
+                      album_id: str = "", exclude_vid: str = "", force: bool = False) -> dict | None:
+    """Resolve metadata to one stable YouTube recording, deduplicating concurrent searches."""
+    identity = _recording_identity_signature(title, artist, duration, album, album_id)
+    target = {"title": title, "artist": artist, "duration": duration, "album": album, "albumId": album_id}
+    if not force:
+        cached = _cached_recording_resolution(identity, exclude_vid=exclude_vid, target=target)
+        if cached:
+            cached["cached"] = True
+            cached["identity"] = identity
+            return cached
+
+    owner = False
+    with _recording_resolution_lock:
+        event = _recording_resolution_inflight.get(identity)
+        if event is None:
+            event = threading.Event()
+            _recording_resolution_inflight[identity] = event
+            owner = True
+    if not owner:
+        completed = event.wait(timeout=12)
+        cached = _cached_recording_resolution(identity, exclude_vid=exclude_vid, target=target)
+        if cached:
+            cached["cached"] = True
+            cached["identity"] = identity
+            return cached
+        if completed and force:
+            return resolve_recording(
+                title, artist, duration, album, album_id,
+                exclude_vid=exclude_vid, force=True,
+            )
+        return None
+
+    try:
+        ranked = _version_aware_yt_candidates(
+            title, artist, duration, exclude_vid=exclude_vid, limit=4,
+            album=album, album_id=album_id,
+        )
+        if not ranked:
+            return None
+        best = ranked[0]
+        _cache_recording_resolution(identity, best, source="search")
+        result = dict(best)
+        result["identity"] = identity
+        return result
+    finally:
+        with _recording_resolution_lock:
+            _recording_resolution_inflight.pop(identity, None)
+            event.set()
+
+
+def _prefetch_recording(track: dict) -> None:
+    title = str(track.get("title") or track.get("name") or "").strip()
+    artist = str(track.get("artist") or track.get("artist_name") or "").strip()
+    if not title or not artist or track.get("videoId"):
+        return
+    identity = _recording_identity_signature(
+        title, artist, track.get("duration") or track.get("dur"),
+        track.get("album") or track.get("albumName") or "", track.get("albumId") or "",
+    )
+    if _cached_recording_resolution(identity):
+        return
+    with _recording_resolution_lock:
+        if identity in _recording_prefetch_pending:
+            return
+        _recording_prefetch_pending.add(identity)
+
+    def worker():
+        try:
+            resolve_recording(
+                title, artist, track.get("duration") or track.get("dur"),
+                track.get("album") or track.get("albumName") or "", track.get("albumId") or "",
+            )
+        finally:
+            with _recording_resolution_lock:
+                _recording_prefetch_pending.discard(identity)
+
+    _resolution_executor.submit(worker)
 
 def yt_music_search(query: str, limit: int = 7) -> list:
     if not query.strip(): return []
@@ -1213,6 +2411,7 @@ def yt_music_search(query: str, limit: int = 7) -> list:
 def _yt_music_search_uncached(query: str) -> list:
     cleaned = _clean_search_tokens(query)
     tokens = _tokenize_query(cleaned)
+    query_versions = _track_version_profile(cleaned)["tags"]
     try:
         results = ytmusic.search(cleaned, filter="songs", limit=30)
         tracks = []
@@ -1242,6 +2441,10 @@ def _yt_music_search_uncached(query: str) -> list:
                 if tok in artist_lower: score += 1
             if any(tok == title_lower for tok in tokens):
                 score += 50
+            candidate_versions = _track_version_profile(t["name"])["tags"]
+            score += 8 if candidate_versions == query_versions else 0
+            score -= 20 * len(query_versions - candidate_versions)
+            score -= 25 * len(candidate_versions - query_versions)
             t["_score"] = score
         tracks.sort(key=lambda t: t["_score"], reverse=True)
         for t in tracks: del t["_score"]
@@ -1291,7 +2494,19 @@ def _yt_music_search_filtered_uncached(query: str, filter_type: str) -> list:
                 vid = e.get("videoId", "")
                 tid = get_track_id(name, artist)
                 album = e.get("album") or {}
-                tracks.append(_build_track_dict(name, artist, art, dur, tid, vid, album.get("id") or ""))
+                track = _build_track_dict(name, artist, art, dur, tid, vid, album.get("id") or "")
+                query_tokens = _tokenize_query(query)
+                haystack = set(_tokenize_query(f"{artist} {name}"))
+                track["_score"] = len(set(query_tokens) & haystack) * 3
+                query_versions = _track_version_profile(query)["tags"]
+                candidate_versions = _track_version_profile(name)["tags"]
+                track["_score"] += 8 if candidate_versions == query_versions else 0
+                track["_score"] -= 20 * len(query_versions - candidate_versions)
+                track["_score"] -= 25 * len(candidate_versions - query_versions)
+                tracks.append(track)
+            tracks.sort(key=lambda item: item.get("_score", 0), reverse=True)
+            for track in tracks:
+                track.pop("_score", None)
             return tracks[:10]
         elif filter_type == "album":
             albums = []
@@ -1617,15 +2832,66 @@ def _parse_lrc(lrc_text: str) -> list:
     lines.sort(key=lambda x: x["time"])
     return lines
 
-def _write_lyrics_cache(tid: str, data: dict, neg_ttl: int = 0):
+
+def _lyrics_content_score(candidate: dict, target_duration=None) -> tuple[float, str | None]:
+    lines = candidate.get("lines") or []
+    if not lines:
+        return -100.0, "empty"
+    if candidate.get("synced"):
+        timed = [line for line in lines if isinstance(line, dict) and isinstance(line.get("time"), (int, float)) and str(line.get("text") or "").strip()]
+        if len(timed) < 3:
+            return -100.0, "too_few_timed_lines"
+        duration = _coerce_duration_seconds(target_duration)
+        last_time = max(line["time"] for line in timed)
+        if duration and last_time > duration + max(12, duration * 0.08):
+            return -100.0, "timestamps_exceed_track"
+        score = 9.0
+        if duration:
+            coverage = last_time / max(1.0, duration)
+            if coverage >= 0.72:
+                score += 5
+            elif coverage < 0.25:
+                score -= 8
+        return score, None
+    text = "\n".join(str(line.get("text") or "") for line in lines if isinstance(line, dict)).strip()
+    alpha_count = sum(char.isalpha() for char in text)
+    if alpha_count < 24:
+        return -100.0, "plain_lyrics_too_short"
+    return 2.0, None
+
+
+def _select_lyrics_candidate(candidates: list, target_duration=None, minimum: float = 68) -> dict | None:
+    ranked = []
+    for candidate in candidates or []:
+        if not candidate:
+            continue
+        match = candidate.get("_match") or {}
+        if not match.get("acceptable"):
+            continue
+        content_score, rejection = _lyrics_content_score(candidate, target_duration)
+        if rejection:
+            continue
+        source_bonus = 4 if candidate.get("_source") == "lrclib" else 0
+        total = float(match.get("score") or 0) + content_score + source_bonus
+        if total >= minimum:
+            selected = dict(candidate)
+            selected["_selectionScore"] = round(total, 2)
+            ranked.append(selected)
+    ranked.sort(key=lambda item: item["_selectionScore"], reverse=True)
+    return ranked[0] if ranked else None
+
+def _write_lyrics_cache(tid: str, data: dict, neg_ttl: int = 0, identity: str = ""):
     """Write lyrics to in-memory LRU + filesystem cache.
 
     If `neg_ttl` > 0, the entry is treated as a negative-cache hit (empty/no-lyrics result)
     and stamped with an `exp` (epoch-seconds) after which it must be re-validated.
     Positive (real) lyrics carry no `exp` and remain valid until purged manually.
     """
+    data = dict(data)
+    data["cacheVersion"] = _LYRICS_CACHE_VERSION
+    if identity:
+        data["identity"] = identity
     if neg_ttl > 0:
-        data = dict(data)
         data["exp"] = int(time.time()) + neg_ttl
     with _lyrics_mem_lock:
         _lyrics_mem_cache[tid] = data
@@ -1633,11 +2899,11 @@ def _write_lyrics_cache(tid: str, data: dict, neg_ttl: int = 0):
             _lyrics_mem_cache.popitem(last=False)
     try:
         cache_path = LYRICS_DIR / f"{tid}.json"
-        cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_json(cache_path, data)
     except Exception as e:
         log.warning(f"Lyrics cache write failed: {e}")
 
-def _read_lyrics_cache(tid: str) -> dict | None:
+def _read_lyrics_cache(tid: str, identity: str = "") -> dict | None:
     """Read lyrics from in-memory LRU first, then filesystem cache.
 
     Returns None on miss, or on negative-cache entries whose `exp` field has elapsed
@@ -1645,12 +2911,23 @@ def _read_lyrics_cache(tid: str) -> dict | None:
     """
     with _lyrics_mem_lock:
         if tid in _lyrics_mem_cache:
-            _lyrics_mem_cache.move_to_end(tid)
-            return _lyrics_mem_cache[tid]
+            data = _lyrics_mem_cache[tid]
+            try:
+                expired = bool(data.get("exp")) and int(time.time()) >= int(data["exp"])
+            except (TypeError, ValueError):
+                expired = False
+            if not expired and data.get("cacheVersion") == _LYRICS_CACHE_VERSION and (not identity or data.get("identity") == identity):
+                _lyrics_mem_cache.move_to_end(tid)
+                return data
+            _lyrics_mem_cache.pop(tid, None)
     try:
         cache_path = LYRICS_DIR / f"{tid}.json"
         if cache_path.exists():
             data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("cacheVersion") != _LYRICS_CACHE_VERSION or (identity and data.get("identity") != identity):
+                try: cache_path.unlink()
+                except OSError: pass
+                return None
             # Negative-cache expiry check — evict + treat as miss once `exp` has elapsed.
             if isinstance(data, dict) and "exp" in data:
                 try:
@@ -1682,60 +2959,313 @@ def _validate_playlist_path(safe_name: str) -> bool:
     resolved = (PLAYLISTS_DIR / safe_name).resolve()
     return resolved == PLAYLISTS_DIR.resolve() or str(resolved).startswith(str(PLAYLISTS_DIR.resolve()) + os.sep)
 
+
+def _get_playlist_lock(playlist_name: str):
+    """Return the stable re-entrant lock for one sanitized playlist name."""
+    with _playlist_locks_guard:
+        lock = _playlist_locks.get(playlist_name)
+        if lock is None:
+            lock = threading.RLock()
+            _playlist_locks[playlist_name] = lock
+        return lock
+
+
+@contextmanager
+def _playlist_guard(playlist_name: str):
+    """Serialize filesystem operations that mutate or validate one playlist."""
+    lock = _get_playlist_lock(playlist_name)
+    with lock:
+        yield
+
+
+def _quarantine_invalid_json(path: Path, reason: str):
+    """Preserve malformed JSON beside the original so recovery is reversible."""
+    if not path.exists():
+        return
+    quarantine = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+    try:
+        os.replace(path, quarantine)
+        log.warning(f"[playlists] quarantined {path.name}: {reason}")
+    except OSError as e:
+        log.warning(f"[playlists] could not quarantine {path.name}: {e}")
+
+
+def _read_playlist_json(path: Path, label: str, *, quarantine=True) -> dict:
+    """Read a playlist-owned JSON object, rejecting arrays/scalars and bad JSON."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return data
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as e:
+        if quarantine:
+            _quarantine_invalid_json(path, f"{label}: {e}")
+        else:
+            log.warning(f"[playlists] invalid {label} at {path}: {e}")
+        return {}
+
+
+def _coerce_playlist_duration(value) -> int:
+    try:
+        return max(0, min(int(float(value or 0)), 24 * 60 * 60))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _coerce_track_number(value):
+    try:
+        value = int(value)
+        return value if 1 <= value <= 1_000_000 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _normalize_playlist_track(track: dict) -> dict | None:
+    """Normalize imported/client track data to the backward-compatible schema."""
+    if not isinstance(track, dict):
+        return None
+    name = str(track.get("name") or track.get("title") or "").strip()[:500]
+    artist = str(track.get("artist") or track.get("artist_name") or "").strip()[:500]
+    if not name or not artist:
+        return None
+    normalized = {
+        "name": name,
+        "artist": artist,
+        "tid": get_track_id(name, artist),
+        "dur": _coerce_playlist_duration(track.get("dur") or track.get("duration")),
+        "art": str(track.get("art") or track.get("album_art") or "")[:4096],
+        "videoId": str(track.get("videoId") or "")[:128],
+    }
+    art_candidates = track.get("art_candidates")
+    if isinstance(art_candidates, list):
+        normalized["art_candidates"] = [str(url)[:4096] for url in art_candidates[:6] if isinstance(url, str) and url]
+    for key, limit in (("art_source", 64), ("spotify_image_url", 4096), ("isrc", 32)):
+        value = str(track.get(key) or "").strip()[:limit]
+        if value:
+            normalized[key] = value
+    try:
+        if track.get("art_resolved_at"):
+            normalized["art_resolved_at"] = float(track["art_resolved_at"])
+        if track.get("art_confidence") is not None:
+            normalized["art_confidence"] = float(track["art_confidence"])
+    except (TypeError, ValueError):
+        pass
+    album_id = str(track.get("albumId") or "")[:256]
+    if album_id:
+        normalized["albumId"] = album_id
+    album_name = str(track.get("album") or track.get("albumName") or "").strip()[:500]
+    if album_name:
+        normalized["album"] = album_name
+        normalized["albumName"] = album_name
+    number = _coerce_track_number(track.get("trackNumber"))
+    if number is not None:
+        normalized["trackNumber"] = number
+    return normalized
+
+
+def _playlist_meta_payload(track: dict, track_number=None, added_at=None) -> dict:
+    number = _coerce_track_number(track_number)
+    return {
+        "name": track.get("name", track.get("tid", "Unknown")),
+        "artist": track.get("artist", "Unknown Artist"),
+        "dur": _coerce_playlist_duration(track.get("dur")),
+        "art": track.get("art", ""),
+        "trackNumber": number,
+        "videoId": track.get("videoId", ""),
+        "albumId": track.get("albumId", ""),
+        "album": track.get("album") or track.get("albumName") or "",
+        "albumName": track.get("albumName") or track.get("album") or "",
+        "art_candidates": track.get("art_candidates") or [],
+        "art_source": track.get("art_source", ""),
+        "spotify_image_url": track.get("spotify_image_url", ""),
+        "isrc": track.get("isrc", ""),
+        "art_resolved_at": track.get("art_resolved_at", 0),
+        "art_confidence": track.get("art_confidence", 0),
+        "addedAt": float(added_at or time.time()),
+        "downloadState": track.get("downloadState", "pending"),
+        "downloadError": str(track.get("downloadError") or "")[:500],
+    }
+
+
+def _read_track_meta(path: Path, tid: str, *, quarantine=True) -> dict:
+    raw = _read_playlist_json(path, f"track metadata for {tid}", quarantine=quarantine)
+    if not raw:
+        return {}
+    normalized = _normalize_playlist_track(raw)
+    if not normalized:
+        if quarantine:
+            _quarantine_invalid_json(path, "track metadata has no name or artist")
+        return {}
+    # The filename is authoritative for existing local media. New writes and
+    # imports still use the canonical id generated by _normalize_playlist_track.
+    normalized["tid"] = tid
+    normalized["trackNumber"] = _coerce_track_number(raw.get("trackNumber"))
+    state = str(raw.get("downloadState") or "pending")
+    normalized["downloadState"] = state if state in {"remote", "pending", "ready"} else "remote"
+    normalized["downloadError"] = str(raw.get("downloadError") or "")[:500]
+    try:
+        normalized["addedAt"] = float(raw.get("addedAt") or path.stat().st_mtime)
+    except (OSError, TypeError, ValueError):
+        normalized["addedAt"] = 0.0
+    return normalized
+
+
+def _merge_track_meta_extras(path: Path, normalized: dict) -> dict:
+    """Preserve optional provider fields while enforcing normalized core data."""
+    raw = _read_playlist_json(path, f"track metadata for {path.name}")
+    if not raw:
+        return normalized
+    raw.update(normalized)
+    return raw
+
+
+def _tid_from_audio_filename(path: Path) -> str:
+    stem = path.stem
+    if " - " in stem:
+        prefix, candidate = stem.split(" - ", 1)
+        if prefix.isdigit():
+            return candidate
+    return stem
+
+
+def _playlist_existing_tids_locked(pl_dir: Path) -> set:
+    tids = set()
+    if not pl_dir.exists():
+        return tids
+    for path in pl_dir.iterdir():
+        if path.name.endswith(".meta.json"):
+            tid = path.name[:-len(".meta.json")]
+            if _read_track_meta(path, tid):
+                tids.add(tid)
+        elif path.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus"}:
+            tids.add(_tid_from_audio_filename(path))
+    return tids
+
+
+def _next_playlist_track_number_locked(pl_dir: Path) -> int:
+    numbers = _playlist_track_numbers_locked(pl_dir)
+    return (max(numbers) if numbers else 0) + 1
+
+
+def _playlist_track_numbers_locked(pl_dir: Path) -> set:
+    numbers = set()
+    if pl_dir.exists():
+        for path in pl_dir.glob("*.meta.json"):
+            tid = path.name[:-len(".meta.json")]
+            meta = _read_track_meta(path, tid)
+            number = meta.get("trackNumber")
+            if number:
+                numbers.add(number)
+    return numbers
+
+
+def _unique_playlist_name_locked(base_name: str) -> str:
+    candidate = _safe_playlist_name(base_name)
+    if not (PLAYLISTS_DIR / candidate).exists():
+        return candidate
+    for suffix in range(2, 10_000):
+        candidate = _safe_playlist_name(f"{base_name} ({suffix})")
+        if not (PLAYLISTS_DIR / candidate).exists():
+            return candidate
+    raise RuntimeError("Could not allocate a unique playlist name")
+
 def save_album_metadata(playlist_name: str, album_data: dict):
     """Save album metadata to a playlist directory when saving an album."""
-    pl_dir = PLAYLISTS_DIR / playlist_name
-    pl_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = pl_dir / "album.json"
     try:
-        meta_path.write_text(
-            json.dumps({
-                "albumId": album_data.get("albumId", ""),
-                "title": album_data.get("title", playlist_name),
-                "artist": album_data.get("artist", ""),
-                "art": album_data.get("art", ""),
-                "trackCount": len(album_data.get("tracks", [])),
-            }, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with _playlist_catalog_lock:
+            with _playlist_guard(playlist_name):
+                pl_dir = PLAYLISTS_DIR / playlist_name
+                pl_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_write_json(pl_dir / "album.json", {
+                    "albumId": album_data.get("albumId", ""),
+                    "title": album_data.get("title", playlist_name),
+                    "artist": album_data.get("artist", ""),
+                    "art": album_data.get("art", ""),
+                    "trackCount": len(album_data.get("tracks", [])),
+                })
         _invalidate_file_index()
     except Exception as e:
         log.warning(f"Failed to save album metadata: {e}")
 
-def _write_playlist_meta(track: dict, playlist_name: str, track_number=None) -> str:
-    """Synchronously write a track's .meta.json into a playlist dir so the
-    playlist is visible (as a pending entry) before the audio download finishes.
-    Returns the tid. Safe to call from request threads (not the executor)."""
+def _write_playlist_meta_locked(track: dict, playlist_name: str, track_number=None) -> tuple[str, bool]:
+    """Write one metadata file while the caller holds the playlist lock."""
     pl_dir = PLAYLISTS_DIR / playlist_name
     pl_dir.mkdir(parents=True, exist_ok=True)
     tid = track.get("tid") or get_track_id(track.get("name", ""), track.get("artist", ""))
     if not tid:
-        return ""
-    meta_path = pl_dir / f"{tid}.meta.json"
-    if not meta_path.exists():
-        try:
-            meta_path.write_text(
-                json.dumps({
-                    "name": track.get("name", tid),
-                    "artist": track.get("artist", "Unknown Artist"),
-                    "dur": track.get("dur", 0),
-                    "art": track.get("art", ""),
-                    "trackNumber": track_number,
-                    "videoId": track.get("videoId", ""),
-                    "addedAt": time.time(),
-                }, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            _invalidate_file_index()
-        except Exception:
-            pass
-    return tid
+        return "", False
+    if tid in _playlist_existing_tids_locked(pl_dir):
+        return tid, False
+    requested_number = _coerce_track_number(track_number)
+    used_numbers = _playlist_track_numbers_locked(pl_dir)
+    number = requested_number if requested_number and requested_number not in used_numbers else ((max(used_numbers) if used_numbers else 0) + 1)
+    _atomic_write_json(pl_dir / f"{tid}.meta.json", _playlist_meta_payload(track, number))
+    return tid, True
 
 
-def download_to_playlist(track: dict, playlist_name: str, track_number=None) -> bool:
+def _write_playlist_meta(track: dict, playlist_name: str, track_number=None) -> tuple[str, bool]:
+    """Synchronously write a track's .meta.json into a playlist dir so the
+    playlist is visible (as a pending entry) before the audio download finishes.
+    Returns ``(tid, created)``. Network work must happen after this returns."""
+    with _playlist_guard(playlist_name):
+        result = _write_playlist_meta_locked(track, playlist_name, track_number)
+    if result[1]:
+        _invalidate_file_index()
+    return result
+
+
+def _set_playlist_download_state(playlist_name: str, tid: str, state: str, error: str = "", video_id: str = ""):
+    meta_path = PLAYLISTS_DIR / playlist_name / f"{tid}.meta.json"
+    with _playlist_guard(playlist_name):
+        current = _read_playlist_json(meta_path, f"track metadata for {tid}") or {}
+        if not current:
+            return
+        current["downloadState"] = state
+        current["downloadError"] = str(error or "")[:500]
+        if video_id:
+            current["videoId"] = video_id
+        _atomic_write_json(meta_path, current)
+
+
+def _cache_playlist_track_art(track: dict, playlist_name: str) -> bool:
+    tid = track.get("tid") or get_track_id(track.get("name", ""), track.get("artist", ""))
     pl_dir = PLAYLISTS_DIR / playlist_name
-    pl_dir.mkdir(parents=True, exist_ok=True)
+    art_path = pl_dir / f"{tid}.jpg"
+    try:
+        if art_path.exists() and art_path.stat().st_size > 100:
+            return True
+    except OSError:
+        pass
+    try:
+        art_bytes, _working_url = _download_first_artwork(
+            _artwork_urls_for_track(track, resolve_missing=True)
+        )
+        if not art_bytes:
+            return False
+        with _playlist_guard(playlist_name):
+            if not pl_dir.exists():
+                return False
+            try:
+                if art_path.exists() and art_path.stat().st_size > 100:
+                    return True
+            except OSError:
+                pass
+            tmp_art = art_path.with_suffix(".jpg.tmp")
+            tmp_art.write_bytes(art_bytes)
+            os.replace(tmp_art, art_path)
+        _invalidate_file_index()
+        return True
+    except Exception as exc:
+        log.debug("Playlist artwork cache failed for %s: %s", tid, exc)
+        return False
+
+
+def download_to_playlist(track: dict, playlist_name: str, track_number=None, *, cache_art=True) -> bool:
+    pl_dir = PLAYLISTS_DIR / playlist_name
     tid = track.get("tid") or get_track_id(track["name"], track["artist"])
+    meta_path = pl_dir / f"{tid}.meta.json"
     ext_candidates = ["mp3", "m4a", "webm", "opus"]
 
     if track_number is not None:
@@ -1743,84 +3273,104 @@ def download_to_playlist(track: dict, playlist_name: str, track_number=None) -> 
     else:
         prefix = ""
 
-    for ext in ext_candidates:
-        if (pl_dir / f"{prefix}{tid}.{ext}").exists():
-            return True
-    # Meta is written synchronously by the caller (api_playlists_add) now, but
-    # keep this fallback for direct/legacy callers.
-    meta_path = pl_dir / f"{tid}.meta.json"
-    if not meta_path.exists():
-        try:
-            meta_path.write_text(
-                json.dumps({
-                    "name": track.get("name", tid),
-                    "artist": track.get("artist", "Unknown Artist"),
-                    "dur": track.get("dur", 0),
-                    "art": track.get("art", ""),
-                    "trackNumber": track_number,
-                    "videoId": track.get("videoId", ""),
-                    "addedAt": time.time(),
-                }, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            _invalidate_file_index()
-        except Exception:
-            pass
-    art_path = pl_dir / f"{tid}.jpg"
-    if not art_path.exists() and track.get("art"):
-        art_url = track["art"]
-        if art_url.startswith(('https://', 'http://')):
-            try:
-                r = requests.get(art_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                if r.ok:
-                    art_path.write_bytes(r.content)
-                    _invalidate_file_index()
-            except Exception:
-                pass
-    vid = track.get("videoId", "")
-    if vid:
-        source = f"https://www.youtube.com/watch?v={vid}"
-    else:
-        source = f"ytsearch1:{track['artist']} {track['name']} audio"
-
+    already_local = False
+    with _playlist_guard(playlist_name):
+        if not pl_dir.exists() or not meta_path.exists():
+            _record_download_status(tid, False, "Playlist was removed before download started")
+            return False
+        for ext in ext_candidates:
+            if (pl_dir / f"{prefix}{tid}.{ext}").exists():
+                already_local = True
+                break
+    if already_local:
+        _set_playlist_download_state(playlist_name, tid, "ready")
+        if cache_art:
+            _cache_playlist_track_art(track, playlist_name)
+        return True
+    _set_playlist_download_state(playlist_name, tid, "pending")
     if track_number is not None:
         out_name = f"{str(track_number).zfill(2)} - {tid}"
     else:
         out_name = tid
 
+    # Reuse any verified on-device copy before touching the network. This is
+    # especially important when the same liked song appears in several imported
+    # playlists or albums: one successful transfer should satisfy all of them.
+    shared_audio, _shared_tier = _resolve_local_audio(tid)
+    if shared_audio:
+        try:
+            destination = pl_dir / f"{out_name}{shared_audio.suffix.lower()}"
+            with _playlist_guard(playlist_name):
+                if not pl_dir.exists() or not meta_path.exists():
+                    raise FileNotFoundError("Playlist was removed before local media could be reused")
+                if shared_audio.resolve() != destination.resolve():
+                    shutil.copy2(shared_audio, destination)
+            _set_playlist_download_state(playlist_name, tid, "ready", video_id=track.get("videoId", ""))
+            if cache_art:
+                _cache_playlist_track_art(track, playlist_name)
+            _record_download_status(tid, True)
+            _invalidate_file_index()
+            _invalidate_playlist_cache()
+            return True
+        except Exception as exc:
+            log.debug("Could not reuse local audio for %s: %s", tid, exc)
+
+    try:
+        stage_dir = Path(tempfile.mkdtemp(prefix=f"{tid[:12]}-", dir=PLAYLIST_STAGING_DIR))
+    except OSError as e:
+        log.warning(f"Could not create playlist download staging directory for {tid}: {e}")
+        _record_download_status(tid, False, str(e))
+        _set_playlist_download_state(playlist_name, tid, "remote", str(e))
+        _invalidate_playlist_cache()
+        return False
+
+    def progress_hook(state):
+        if state.get("status") == "downloading":
+            print(
+                f"\r[playlist] {track.get('name', tid)} — {state.get('_percent_str', '…')} "
+                f"({state.get('_speed_str', '')})", end="", flush=True,
+            )
+        else:
+            print(f"[playlist] {track.get('name', tid)} — processing…", flush=True)
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": str(pl_dir / out_name),
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-        **_YDL_COMMON_OPTS,   # keeps quiet=True — progress_hooks still fire regardless
+        "outtmpl": str(stage_dir / out_name),
+        **_YDL_DOWNLOAD_OPTS,
         "noprogress": True,   # silence yt-dlp's own [download] bar; our hook below prints progress
         "http_headers": {"User-Agent": _YDL_USER_AGENT},
         "no_color": True,
         **_ydl_extras(),
-        "progress_hooks": [lambda d: print(
-            f"\r[playlist] {track.get('name', tid)} — {d.get('_percent_str', '…')} "
-            f"({d.get('_speed_str', '')})", end="", flush=True) if d['status'] == 'downloading' else
-            print(f"[playlist] {track.get('name', tid)} — processing…", flush=True)
-        ],
+        "progress_hooks": [progress_hook],
     }
+    ydl_opts["postprocessors"] = [{
+        "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
+    }]
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([source])
+        if IS_ANDROID:
+            completed, resolved_vid = _download_android_resolved_audio(
+                dict(track, tid=tid), stage_dir, out_name,
+            )
+        else:
+            source, resolved_vid = _download_source_for_track(track)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([source])
+            completed = next(
+                (f for f in stage_dir.glob(f"{out_name}*") if f.suffix in {".mp3", ".m4a", ".webm", ".opus"}),
+                None,
+            )
+        if resolved_vid and not track.get("videoId"):
+            track["videoId"] = resolved_vid
         print(f"[playlist] {track.get('name', tid)} — done", flush=True)
-        for f in pl_dir.glob(f"{out_name}*"):
-            if f.suffix == ".mp3":
-                if f.name != f"{out_name}.mp3":
-                    f.rename(pl_dir / f"{out_name}.mp3")
-                break
-            elif f.suffix in [".m4a", ".webm", ".opus"]:
-                f.rename(pl_dir / f"{out_name}.mp3")
-                break
+        with _playlist_guard(playlist_name):
+            if not pl_dir.exists() or not meta_path.exists():
+                raise FileNotFoundError(f"Playlist was removed while downloading: {playlist_name}")
+            if completed is None:
+                raise FileNotFoundError("Downloader completed without an audio file")
+            destination_suffix = completed.suffix if IS_ANDROID else ".mp3"
+            os.replace(completed, pl_dir / f"{out_name}{destination_suffix}")
+        _set_playlist_download_state(playlist_name, tid, "ready", video_id=resolved_vid)
+        if cache_art:
+            _cache_playlist_track_art(track, playlist_name)
         _record_download_status(tid, True)
         _invalidate_file_index()
         _invalidate_playlist_cache()
@@ -1828,28 +3378,14 @@ def download_to_playlist(track: dict, playlist_name: str, track_number=None) -> 
     except Exception as e:
         log.warning(f"Playlist download failed for {tid}: {e}")
         _record_download_status(tid, False, str(e))
-        # Clean up: remove .meta.json so the track doesn't show as "pending" forever
-        try:
-            if meta_path.exists():
-                meta_path.unlink()
-        except Exception:
-            pass
-        # Remove any partial audio files left behind by yt_dlp
-        try:
-            for f in pl_dir.glob(f"{out_name}*"):
-                if f.suffix in (".mp3", ".m4a", ".webm", ".opus", ".part") or f.name.endswith(".temp"):
-                    f.unlink(missing_ok=True)
-        except Exception:
-            pass
-        # Remove orphaned artwork file if it exists
-        try:
-            if art_path.exists():
-                art_path.unlink()
-        except Exception:
-            pass
+        # Preserve playlist metadata so a failed item stays visible and can be
+        # retried by Offline Play instead of disappearing from the collection.
+        _set_playlist_download_state(playlist_name, tid, "remote", str(e))
         _invalidate_file_index()
         _invalidate_playlist_cache()
         return False
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 # ── TEMP BURST DETECTOR (remove after debugging) ──────────────────────────────
 import collections
@@ -1876,55 +3412,368 @@ def index():
     user_agent = request.headers.get("User-Agent", "").lower()
     mobile_words = ["android", "iphone", "ipad", "blackberry", "windows phone"]
     
-    # Isolate mobile traffic cleanly without breaking the desktop engine
+    # Isolate mobile traffic cleanly without breaking the desktop engine.
+    # The legacy mobile template remains available at /mobile/legacy while the
+    # first-class album-centered player is developed independently.
     if any(word in user_agent for word in mobile_words):
-        return render_template("mobile.html")
-        
+        return render_template("mobile_player.html")
+         
     return render_template("player.html")
+
+
+@app.route("/mobile/legacy")
+def mobile_player_legacy():
+    return render_template("mobile.html")
 
 @app.route("/api/stream")
 def api_stream():
     q = request.args.get("q", "")
     tid = request.args.get("tid", "")
     vid = request.args.get("vid", "")
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+    duration = request.args.get("duration", "")
+    album = request.args.get("album", "")
+    album_id = request.args.get("album_id", "") or request.args.get("albumId", "")
     force = request.args.get("force", "") in ("1", "true", "yes")
+    local_only = request.args.get("local_only", "") in ("1", "true", "yes")
+    skip_local = request.args.get("skip_local", "") in ("1", "true", "yes")
     if q.startswith("http") and "youtube.com" not in q and "youtu.be" not in q:
         return jsonify({"error": "Only YouTube URLs are supported"}), 400
     _c = request.args.get("_c", "")
     print(f"[STREAM] q={q[:60]} tid={tid[:12]} vid={vid[:12]} caller={_c[:60]}", flush=True)
     _burst_check("stream", tid or q[:40])
-    if tid:
-        for _ext in (".mp3", ".m4a", ".webm", ".opus"):
-            if (SAVED_DIR / f"{tid}{_ext}").exists():
-                return jsonify({"url": f"/api/local_file?q={tid}{_ext}", "local": True})
-        idx = _get_file_index()
-        for _ext in (".mp3", ".m4a", ".webm", ".opus"):
-            matched = idx.get(f"{tid}{_ext}")
-            if matched and matched.is_file():
-                return jsonify({"url": f"/api/library_file?q={tid}{_ext}", "local": True})
+    if tid and not skip_local:
+        local = _local_media_payload(tid)
+        if local.get("local_audio"):
+            return jsonify({
+                "url": local["url"],
+                "local": True,
+                "offlineReady": True,
+                "source": local.get("audio_source"),
+                "format": local.get("format"),
+            })
+    if local_only:
+        return jsonify({
+            "error": "Track is not available offline",
+            "offline": True,
+            "local": False,
+        }), 503
     try:
-        result = get_stream_url(q, tid, vid, force=force)
+        result = _resolve_stream_url(
+            q, tid, vid, force=force, title=title, artist=artist,
+            duration=duration, album=album, album_id=album_id,
+        )
     except Exception as e:
-        print(f"[STREAM] get_stream_url EXCEPTION: {e}", flush=True)
+        print(f"[STREAM] EXCEPTION: {e}", flush=True)
         result = {"error": str(e)}
     if "error" in result:
         print(f"[STREAM] ERROR: {result['error']}", flush=True)
-    if "url" in result and not result.get("local") and not result.get("cached"):
-        if not tid:
-            tid = get_track_id(q, "proxy")
-        raw_url = result["url"]
-        _cache_stream(tid, result["url"])
-        result["url"] = f"/api/proxy_stream?url_key={tid}"
-        result["streamUrl"] = raw_url
-    elif "url" in result and result.get("cached") and tid:
-        raw_url = result["url"]
-        result["url"] = f"/api/proxy_stream?url_key={tid}"
-        result["streamUrl"] = raw_url
+        return jsonify(result), 502
+    # Cache and return proxy URL
+    if result.get("url") and not result.get("local"):
+        stream_identity = _recording_identity_signature(title, artist, duration, album, album_id) if title and artist else ""
+        _cache_stream(tid, result["url"], stream_identity, result)
+    result["url"] = f"/api/proxy_stream?url_key={tid}"
+    if not _c.startswith("mobile-player"):
+        result["streamUrl"] = result["url"]
+    if result.get("url") and not result.get("local"):
+        result["transport"] = "proxy"
     return jsonify(result)
+
+
+def _resolve_stream_url(q, tid, vid, force, title, artist, duration, album, album_id):
+    """Resolve a playable stream URL for the given track.
+    
+    Single-pass extraction:
+    1. Check stream cache (respecting force flag)
+    2. Resolve recording identity
+    3. ONE yt-dlp extraction with proper cookies + JS runtime
+    4. Cache and return raw googlevideo URL
+    """
+    recording_identity = _recording_identity_signature(title, artist, duration, album, album_id) if title and artist else ""
+    
+    # 1. Stream cache lookup
+    if tid and not force:
+        with _stream_cache_lock:
+            if tid in _stream_cache:
+                cached = _stream_cache[tid]
+                entry = cached if isinstance(cached, dict) else {"url": cached}
+                exp = entry.get("exp") or 0
+                url = entry["url"]
+                if (recording_identity and entry.get("identity") != recording_identity) or (exp and exp <= time.time()):
+                    _stream_cache.pop(tid, None)
+                else:
+                    _stream_cache.move_to_end(tid)
+                    result = {"url": url, "cached": True}
+                    for key in ("matchedVideoId", "matchConfidence", "recordingResolved"):
+                        if entry.get(key) is not None:
+                            result[key] = entry[key]
+                    return result
+    elif tid and force:
+        with _stream_cache_lock:
+            _stream_cache.pop(tid, None)
+    
+    # 2. Determine target videoId
+    target_vid = vid
+    match_result = {}
+    
+    if not target_vid and title and artist:
+        resolved = resolve_recording(title, artist, duration, album, album_id, exclude_vid="", force=force)
+        if resolved and resolved.get("videoId"):
+            target_vid = resolved["videoId"]
+            match_result = {
+                "matchedVideoId": target_vid,
+                "matchConfidence": resolved.get("_match", {}).get("score") or resolved.get("confidence"),
+                "recordingResolved": True,
+            }
+            if recording_identity:
+                _cache_recording_resolution(recording_identity, resolved, source="search")
+    
+    if not target_vid:
+        # Fallback: ytsearch query
+        search_query = q if q else f"{artist} {title}" if artist and title else ""
+        if not search_query:
+            return {"error": "No search query available"}
+        target_vid = f"ytsearch1:{search_query}"
+    
+    # 3. Single yt-dlp extraction with full options
+    url, auth_fail_seen = _extract_stream_url(target_vid)
+    if not url:
+        print(f"[STREAM_URL] ALL FAILED for: {q[:50]} (vid={target_vid})", flush=True)
+        return {"error": "Stream not available"}
+    
+    if not auth_fail_seen:
+        _cache_stream(tid, url, recording_identity, match_result)
+    return {"url": url, **match_result}
+
+
+def _extract_stream_url(target_vid):
+    """Extract a playable stream URL using yt-dlp with full options.
+    
+    Returns (url, auth_fail_seen) or (None, False) on failure.
+    """
+    source = f"https://www.youtube.com/watch?v={target_vid}" if not target_vid.startswith("ytsearch") else target_vid
+    
+    fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+    ydl_opts = {
+        "format": fmt,
+        **_YDL_EXTRACT_OPTS,
+        "http_headers": {"User-Agent": _YDL_USER_AGENT},
+        **_ydl_extras(),
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(source, download=False)
+            if "entries" in info:
+                entries = [e for e in info["entries"] if e]
+                if not entries:
+                    return None, False
+                info = entries[0]
+            formats = info.get("formats", [])
+            # Strict audio format filtering: must have audio codec, no video codec, audio MIME type
+            audio = []
+            for f in formats:
+                vcodec = f.get("vcodec") or ""
+                acodec = f.get("acodec") or ""
+                mime = (f.get("mimeType") or "").lower()
+                ext = (f.get("ext") or "").lower()
+                format_id = (f.get("format_id") or "").lower()
+                url = f.get("url") or ""
+                if not url:
+                    continue
+                # Must have audio codec, no video codec, and be audio MIME or known audio ext
+                if acodec == "none" or vcodec != "none":
+                    continue
+                if not (mime.startswith("audio/") or ext in ("m4a", "webm", "mp3", "opus", "ogg", "aac")):
+                    continue
+                # Skip thumbnails/storyboards
+                if any(x in format_id for x in ("thumbnail", "storyboard", "still", "image")):
+                    continue
+                audio.append(f)
+            if not audio:
+                # Fallback: any format with audio codec and no video codec
+                audio = [f for f in formats if f.get("acodec") != "none" and f.get("vcodec") == "none" and f.get("url")]
+            if not audio:
+                return info.get("url"), False
+            best = max(audio, key=lambda f: ({"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))
+            return best["url"], False
+    except Exception as e:
+        msg = str(e)
+        auth_fail_seen = bool(_AUTH_FAIL_RE.search(msg))
+        if auth_fail_seen:
+            print(f"[AUTH_FAIL] vid={target_vid} err={msg[:120]}", flush=True)
+        return None, auth_fail_seen
+
+
+def _stream_warm_is_current(scope: str, generation: str) -> bool:
+    with _stream_warm_lock:
+        return _stream_warm_latest.get(scope) == generation
+
+
+def _probe_stream_url(url: str) -> bool:
+    """Read one small range to warm DNS/TLS/CDN state without buffering audio.
+    Uses the same headers as the proxy's INITIAL request (no Range) to accurately
+    detect expired/blocked URLs before returning them to the frontend."""
+    if not url or not url.startswith(("https://", "http://")):
+        return False
+    # Match the proxy's initial request: no Range header on first request
+    # (browser doesn't send Range initially; proxy only adds if client sends it)
+    headers = {
+        "User-Agent": _YDL_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+    }
+    # Add YouTube/Google cookies to avoid 403 bot checks on googlevideo
+    cookie_hdr = ""
+    try:
+        cookie_path = _resolve_cookie_file()
+        if cookie_path:
+            try:
+                txt = cookie_path.read_text(encoding="utf-8", errors="ignore")
+                cookie_hdr = _parse_netscape_cookies(txt, youtube_only=False)
+                if cookie_hdr:
+                    headers["Cookie"] = cookie_hdr
+            except Exception:
+                pass
+    except Exception:
+        pass
+    response = None
+    try:
+        session = _stream_curl if _stream_curl is not None else _fallback_proxy_session
+        response = session.get(url, headers=headers, timeout=8, stream=True)
+        if response.status_code not in (200, 206):
+            return False
+        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type and not (
+            content_type.startswith(("audio/", "video/")) or
+            content_type in ("application/octet-stream", "binary/octet-stream")
+        ):
+            return False
+        iterator = response.iter_content(chunk_size=32768)
+        chunk = next(iterator, b"")
+        return bool(chunk)
+    except Exception as exc:
+        log.debug("Stream warm probe failed: %s", exc)
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def _queue_stream_warm(track: dict, scope: str, generation: str, immediate: bool = False) -> bool:
+    tid = str(track.get("tid") or get_track_id(track.get("name", ""), track.get("artist", "")))
+    pending_key = (scope, generation, tid)
+    with _stream_warm_lock:
+        if pending_key in _stream_warm_pending:
+            return False
+        _stream_warm_pending.add(pending_key)
+
+    def worker():
+        started = time.perf_counter()
+        try:
+            # A brief intent window lets a hover/click supersede the automatic
+            # top-result warm before expensive QuickJS extraction begins.
+            # Skip for explicit user clicks (immediate=true).
+            if not immediate:
+                time.sleep(0.2)
+            if not _stream_warm_is_current(scope, generation):
+                return
+            if _local_media_payload(tid).get("local_audio"):
+                return
+            name = track.get("name") or track.get("title") or ""
+            artist = track.get("artist") or track.get("artist_name") or ""
+            result = resolve_stream_singleflight(
+                f"{artist} {name} audio".strip(), tid, track.get("videoId") or "",
+                title=name, artist=artist, duration=track.get("dur") or track.get("duration"),
+                album=track.get("album") or track.get("albumName") or "",
+                album_id=track.get("albumId") or "",
+            )
+            if not _stream_warm_is_current(scope, generation):
+                return
+            if isinstance(result, dict) and result.get("url"):
+                _probe_stream_url(result["url"])
+                log.debug("Stream warmed in %.0fms: %s — %s",
+                          (time.perf_counter() - started) * 1000, artist, name)
+        finally:
+            with _stream_warm_lock:
+                _stream_warm_pending.discard(pending_key)
+
+    _stream_warm_executor.submit(worker)
+    return True
+
+
+@app.route("/api/stream/prefetch", methods=["POST"])
+def api_stream_prefetch():
+    """Warm recording IDs for queues or full streams for likely search clicks."""
+    data = request.get_json(silent=True) or {}
+    tracks = data.get("tracks") if isinstance(data, dict) else None
+    if not isinstance(tracks, list):
+        return jsonify({"error": "tracks must be a list"}), 400
+    mode = "stream" if data.get("mode") == "stream" else "recording"
+    scope = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(data.get("scope") or mode))[:80] or mode
+    generation = str(data.get("generation") or time.time_ns())[:80]
+    immediate = bool(data.get("immediate"))
+    with _stream_warm_lock:
+        if scope not in _stream_warm_latest and len(_stream_warm_latest) >= 100:
+            _stream_warm_latest.pop(next(iter(_stream_warm_latest)), None)
+        _stream_warm_latest[scope] = generation
+    accepted = 0
+    limit = 2 if mode == "stream" else 4
+    for raw in tracks[:limit]:
+        if not isinstance(raw, dict):
+            continue
+        track = {
+            "name": str(raw.get("name") or raw.get("title") or "")[:500],
+            "artist": str(raw.get("artist") or raw.get("artist_name") or "")[:500],
+            "dur": raw.get("dur") or raw.get("duration") or "",
+            "album": str(raw.get("album") or raw.get("albumName") or "")[:500],
+            "albumId": str(raw.get("albumId") or "")[:256],
+            "videoId": str(raw.get("videoId") or "")[:128],
+            "tid": str(raw.get("tid") or "")[:128],
+        }
+        if not track["name"] or not track["artist"]:
+            continue
+        if mode == "stream":
+            accepted += int(_queue_stream_warm(track, scope, generation, immediate))
+        elif not track["videoId"]:
+            _prefetch_recording(track)
+            accepted += 1
+    return jsonify({"success": True, "queued": accepted, "mode": mode}), 202
+
+
+@app.route("/api/media/status", methods=["POST"])
+def api_media_status():
+    """Batch-reconcile persisted client flags with the files currently on disk."""
+    data = request.get_json(silent=True) or {}
+    tids = data.get("tids") if isinstance(data, dict) else None
+    if not isinstance(tids, list):
+        return jsonify({"error": "tids must be a list"}), 400
+    clean_tids = []
+    seen = set()
+    for raw in tids[:1000]:
+        tid = str(raw or "").strip()
+        if tid and tid not in seen and _SAFE_FILENAME_RE.fullmatch(tid):
+            seen.add(tid)
+            clean_tids.append(tid)
+    index = _get_file_index()
+    return jsonify({
+        "tracks": {tid: _local_media_payload(tid, index=index) for tid in clean_tids},
+        "count": len(clean_tids),
+    })
 
 @app.route("/api/proxy_stream")
 def api_proxy_stream():
     url_key = request.args.get("url_key", "")
+    print(f"[PROXY-DEBUG] request url_key={url_key[:12]}... cache_exists={url_key in _stream_cache}", flush=True)
     with _stream_cache_lock:
         cached = _stream_cache.get(url_key)
     if not cached:
@@ -1942,17 +3791,35 @@ def api_proxy_stream():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": "https://www.youtube.com/",
             "Origin": "https://www.youtube.com",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "identity",
         }
+        # Add YouTube/Google cookies to avoid 403 bot checks on googlevideo
+        try:
+            cookie_path = _resolve_cookie_file()
+            if cookie_path:
+                try:
+                    txt = cookie_path.read_text(encoding="utf-8", errors="ignore")
+                    # Use YouTube/Google cookies for googlevideo requests
+                    cookie_hdr = _parse_netscape_cookies(txt, youtube_only=False)
+                    if cookie_hdr:
+                        req_headers["Cookie"] = cookie_hdr
+                except Exception:
+                    pass
+        except Exception:
+            pass
         range_header = request.headers.get("Range")
         if range_header:
             req_headers["Range"] = range_header
-        if _curl:
-            upstream = _curl.get(url, headers=req_headers, timeout=15, stream=True)
+        if _stream_curl:
+            upstream = _stream_curl.get(url, headers=req_headers, timeout=15, stream=True)
         else:
             # Reuse _fallback_proxy_session across calls to amortize TCP/TLS handshake.
             # Danger signal: requests.get returned `requests.adapters.HTTPAdapter`-cached
             # conns don't survive hard 5xx; the next call will reconnect — acceptable.
             upstream = _fallback_proxy_session.get(url, headers=req_headers, stream=True, timeout=15)
+        print(f"[PROXY-DEBUG] upstream_status={upstream.status_code} content_type={upstream.headers.get('Content-Type')}", flush=True)
         if upstream.status_code not in (200, 206):
             # Auto-heal: 403/410 from googlevideo is the classic expired-URL signature.
             # Evict the stale entry so the next /api/stream falls back to yt-dlp re-extract
@@ -1984,11 +3851,21 @@ def api_proxy_stream():
             except Exception:
                 pass
             return jsonify({"error": f"Upstream returned non-media content ({ct})", "stale": True}), 502
-        excluded = {"content-encoding", "transfer-encoding", "content-length", "connection"}
+        # MediaSource on Android Chromium is noticeably quicker to begin a
+        # ranged response when the upstream byte boundaries survive the local
+        # proxy. Content-Length is safe to retain when Requests/curl_cffi has
+        # not decoded a compressed entity; YouTube media responses are
+        # normally identity encoded. Keep stripping hop-by-hop headers.
+        excluded = {"content-encoding", "transfer-encoding", "connection"}
+        if upstream.headers.get("Content-Encoding"):
+            excluded.add("content-length")
         resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in excluded}
         def generate():
             try:
-                for chunk in upstream.iter_content(chunk_size=65536):
+                # A smaller first yield lowers time-to-first-audio in Android
+                # WebView while remaining large enough to avoid Python-heavy
+                # per-chunk overhead on sustained playback.
+                for chunk in upstream.iter_content(chunk_size=32768):
                     if chunk:
                         yield chunk
             finally:
@@ -2004,15 +3881,16 @@ def api_proxy_stream():
 @app.route("/api/favorites")
 def api_favorites():
     favs = _load_favorites()
-    # Batch-check local file existence to minimize syscalls
+    # Batch-reconcile against both SAVED and playlist storage. A track that is
+    # downloaded inside a playlist is just as offline-ready as a SAVED copy.
     audio_tids = {f.get('tid') or get_track_id(f.get('name', ''), f.get('artist', '')) for f in favs}
-    existing_audio = {tid for tid in audio_tids if (SAVED_DIR / f"{tid}.mp3").is_file()}
-    existing_art = {tid for tid in audio_tids if (SAVED_DIR / f"{tid}.jpg").is_file()}
+    index = _get_file_index()
+    statuses = {tid: _local_media_payload(tid, index=index) for tid in audio_tids}
     for f in favs:
         tid = f.get('tid') or get_track_id(f.get('name', ''), f.get('artist', ''))
         f['tid'] = tid
-        f['local_audio'] = tid in existing_audio
-        f['local_art'] = tid in existing_art
+        f['local_audio'] = statuses[tid]['local_audio']
+        f['local_art'] = statuses[tid]['local_art']
     return jsonify(favs)
 
 @app.route("/api/save_favorites", methods=["POST"])
@@ -2029,12 +3907,13 @@ def api_save_favorites():
         # paid art_path.exists() + executor scheduling for the whole collection
         # each toggle. Now we filter to the (usually empty) set that actually
         # needs work, so a toggle of an already-downloaded track is ~free.
+        queued = []
         for f in favs:
             tid = f.get('tid') or get_track_id(f.get('name', ''), f.get('artist', ''))
-            audio_missing = not (SAVED_DIR / f"{tid}.mp3").exists()
-            if audio_missing:
-                _download_executor.submit(download_track, f)
-        return jsonify({"success": True})
+            f['tid'] = tid
+            if _enqueue_favorite_download(f):
+                queued.append(tid)
+        return jsonify({"success": True, "queued": queued})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -2251,6 +4130,11 @@ def api_img_proxy():
       ETag-less (cache-control alone is enough; URLs include size hashes so
       version skew is impossible), uses curl_cffi Chrome impersonation when
       available so hotlink/Referer-protected CDNs (Apple, Google) succeed.
+
+    LQIP (Low Quality Image Placeholder) support:
+      Add `?lqip=1` to get a tiny (10px) blurred JPEG (~200-500 bytes) suitable
+      for inline base64 placeholders. Optional params: `w` (width, default 10),
+      `q` (quality 1-100, default 10), `blur` (gaussian radius, default 20).
     """
     import io
     u = request.args.get("u", "")
@@ -2262,6 +4146,13 @@ def api_img_proxy():
     # local network or the host (cloud metadata 169.254.169.254, routers, etc.).
     if not (u.startswith("https://") or u.startswith("http://")):
         return ("", 400)
+
+    # LQIP parameters
+    lqip = request.args.get("lqip", "") in ("1", "true", "yes")
+    lqip_w = max(1, min(int(request.args.get("w", "10")), 50))
+    lqip_q = max(1, min(int(request.args.get("q", "10")), 100))
+    lqip_blur = max(0, min(int(request.args.get("blur", "20")), 50))
+
     try:
         if _is_private_or_link_local(u):
             return ("", 400)
@@ -2304,17 +4195,116 @@ def api_img_proxy():
             if not ("octet-stream" in ctype or "binary" in ctype):
                 return ("", 404)
             ctype = "image/jpeg"
+
+        # LQIP processing: generate tiny blurred placeholder
+        if lqip:
+            try:
+                from PIL import Image, ImageFilter
+                img = Image.open(io.BytesIO(raw))
+                img = img.convert("RGB")
+                # Downscale to tiny size
+                img.thumbnail((lqip_w, lqip_w), Image.Resampling.LANCZOS)
+                # Apply gaussian blur
+                if lqip_blur > 0:
+                    img = img.filter(ImageFilter.GaussianBlur(radius=lqip_blur))
+                # Encode to JPEG with low quality
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=lqip_q, optimize=True)
+                raw = buf.getvalue()
+                ctype = "image/jpeg"
+            except Exception as e:
+                log.warning(f"LQIP generation failed for {u!r}: {e}")
+                # Fall through to return original image
+
         resp = app.response_class(raw, mimetype=ctype)
         # 7-day browser cache. Combined with the proxy URL including the
         # upstream URL + size param, the LLVM-style URL identity gives perfect
         # cache hit semantics — same source URL always returns the same bytes
         # until the upstream changes (and `?w=` resize URLs are distinct).
-        resp.headers["Cache-Control"] = "public, max-age=604800, immutable"
+        # For LQIP, use shorter cache (1 day) since it's a derivative.
+        cache_age = 86400 if lqip else 604800
+        resp.headers["Cache-Control"] = f"public, max-age={cache_age}, immutable"
         resp.headers["X-Content-Type-Options"] = "nosniff"
         return resp
     except Exception as e:
         log.warning(f"img-proxy failed for {u!r}: {e}")
         return ("", 404)
+
+
+@app.route("/api/artwork/resolve", methods=["POST"])
+def api_artwork_resolve():
+    """Resolve ranked artwork alternatives for any Track Schema source."""
+    data = request.get_json(silent=True) or {}
+    tracks = data.get("tracks") if isinstance(data, dict) else None
+    if not isinstance(tracks, list):
+        return jsonify({"error": "tracks must be a list"}), 400
+    safe_tracks = []
+    for raw in tracks[:25]:
+        if not isinstance(raw, dict):
+            continue
+        safe_tracks.append({
+            "name": str(raw.get("name") or raw.get("title") or "")[:500],
+            "artist": str(raw.get("artist") or raw.get("artist_name") or "")[:500],
+            "album": str(raw.get("album") or raw.get("albumName") or "")[:500],
+            "dur": raw.get("dur") or raw.get("duration") or "",
+            "videoId": str(raw.get("videoId") or "")[:128],
+            "art": str(raw.get("art") or "")[:4096],
+            "album_art": str(raw.get("album_art") or "")[:4096],
+            "art_candidates": raw.get("art_candidates") if isinstance(raw.get("art_candidates"), list) else [],
+            "art_source": str(raw.get("art_source") or "")[:64],
+            "spotify_image_url": str(raw.get("spotify_image_url") or "")[:4096],
+            "isrc": str(raw.get("isrc") or "")[:32],
+        })
+    force = bool(data.get("force")) if isinstance(data, dict) else False
+    return jsonify({"tracks": resolve_artwork_batch(safe_tracks, force=force)})
+
+
+@app.route("/api/artwork/upload", methods=["POST"])
+def api_artwork_upload():
+    """Upload custom artwork for a track. Expects multipart/form-data with:
+    - file: image file (will be cropped to 1:1 square)
+    - tid: track ID (used as filename)
+    Returns the local artwork URL."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    tid = request.form.get('tid', '').strip()
+    if not tid or not _SAFE_FILENAME_RE.fullmatch(tid):
+        return jsonify({"error": "Invalid or missing track ID"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    # Validate file type
+    allowed_types = {'image/jpeg', 'image/png', 'image/webp', 'image/gif'}
+    if file.content_type not in allowed_types:
+        return jsonify({"error": "Unsupported file type"}), 400
+    # Read and process image
+    try:
+        from PIL import Image
+        img = Image.open(file.stream)
+        img = img.convert("RGB")
+        # Crop to 1:1 square (center crop)
+        w, h = img.size
+        size = min(w, h)
+        left = (w - size) // 2
+        top = (h - size) // 2
+        img = img.crop((left, top, left + size, top + size))
+        # Resize to max 1200x1200 for storage
+        max_size = 1200
+        if size > max_size:
+            img = img.resize((max_size, max_size), Image.Resampling.LANCZOS)
+        # Save to SAVED_DIR
+        save_path = SAVED_DIR / f"{tid}.jpg"
+        img.save(save_path, format="JPEG", quality=90, optimize=True)
+    except Exception as e:
+        log.warning(f"Artwork upload failed for {tid}: {e}")
+        return jsonify({"error": f"Failed to process image: {e}"}), 500
+    # Invalidate caches
+    _invalidate_file_index()
+    return jsonify({
+        "success": True,
+        "url": f"/api/local_file?q={tid}.jpg",
+        "tid": tid
+    })
 
 
 @app.route("/api/artist/bio")
@@ -2438,110 +4428,118 @@ def api_local_file():
     file_path = SAVED_DIR / filename
     if file_path.exists() and file_path.is_file():
         directory = str(file_path.parent)
-        return send_from_directory(directory, filename)
+        response = send_from_directory(
+            directory, filename, conditional=True, mimetype=_local_media_mimetype(file_path)
+        )
+        response.headers.setdefault("Accept-Ranges", "bytes")
+        response.headers.setdefault("Cache-Control", "private, no-cache")
+        response.headers["X-Aki-Local"] = "saved"
+        return response
     # Use reverse index instead of rglob
     idx = _get_file_index()
     matched = idx.get(filename)
     if matched and matched.is_file():
-        return send_from_directory(str(matched.parent), filename)
+        response = send_from_directory(
+            str(matched.parent), matched.name, conditional=True, mimetype=_local_media_mimetype(matched)
+        )
+        response.headers.setdefault("Accept-Ranges", "bytes")
+        response.headers.setdefault("Cache-Control", "private, no-cache")
+        response.headers["X-Aki-Local"] = "library"
+        return response
     return jsonify({"error": "Not found"}), 404
 
 def _scan_playlists():
     playlists = []
-    if PLAYLISTS_DIR.exists():
-        for entry in sorted(PLAYLISTS_DIR.iterdir()):
-            if entry.is_dir() and not entry.name.startswith("."):
+    if not PLAYLISTS_DIR.exists():
+        return playlists
+    for entry in sorted(PLAYLISTS_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        with _playlist_guard(entry.name):
+            try:
                 files = list(entry.iterdir())
-                mp3_files = sorted(f for f in files if f.suffix == ".mp3")
-                count = len(mp3_files)
-                meta_files = sorted(f for f in files if f.name.endswith(".meta.json"))
-                # A dir is a real playlist if it has at least one .mp3 (downloaded)
-                # OR at least one .meta.json (track queued / downloading).
-                # Completely empty dirs (no mp3, no meta) are skipped — those are
-                # abandoned create-without-add attempts.
-                if count == 0 and not meta_files:
-                    continue
-                cover_art = ""
-                is_album = False
-                album_meta = {}
-                playlist_meta = {}
-                # Read playlist.json (source, spotifyPlaylistId, etc.)
-                playlist_meta_file = entry / "playlist.json"
-                if playlist_meta_file.exists():
-                    try:
-                        playlist_meta = json.loads(playlist_meta_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        pass
-                # Check for explicit cover.jpg first (e.g. Spotify playlist cover)
-                local_cover = entry / "cover.jpg"
+            except OSError:
+                continue
+            audio_files = sorted(f for f in files if f.suffix.lower() in _LOCAL_AUDIO_EXTENSIONS)
+            meta_files = sorted(f for f in files if f.name.endswith(".meta.json"))
+            if not audio_files and not meta_files:
+                continue
+            audio_tids = {_tid_from_audio_filename(path) for path in audio_files}
+            valid_meta = {}
+            for meta_path in meta_files:
+                tid = meta_path.name[:-len(".meta.json")]
+                meta = _read_track_meta(meta_path, tid)
+                if meta:
+                    valid_meta[tid] = meta
+            if not audio_files and not valid_meta:
+                continue
+            count = len(audio_tids | set(valid_meta))
+            playlist_meta = _read_playlist_json(entry / "playlist.json", "playlist metadata")
+            album_meta = _read_playlist_json(entry / "album.json", "album metadata")
+            cover_art = ""
+            local_cover = entry / "cover.jpg"
+            try:
                 if local_cover.exists() and local_cover.stat().st_size > 100:
                     cover_art = f"/api/library_file?q={entry.name}/cover.jpg"
-                album_meta_file = entry / "album.json"
-                if album_meta_file.exists():
-                    try:
-                        album_meta = json.loads(album_meta_file.read_text(encoding="utf-8"))
-                        if not cover_art:
-                            cover_art = album_meta.get("art", "")
-                        is_album = True
-                    except Exception as e:
-                        log.warning(f"Failed to parse album.json in {entry.name}: {e}")
-                if not cover_art:
-                    # Prefer cover art from a downloaded track's meta first.
-                    for f in mp3_files:
-                        stem = f.stem
-                        if " - " in stem and stem[:2].isdigit():
-                            tid = stem.split(" - ", 1)[1]
-                        else:
-                            tid = stem
-                        meta_file = entry / f"{tid}.meta.json"
-                        if meta_file.exists():
-                            try:
-                                meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                                cover_art = meta.get("art", "")
-                                if cover_art:
-                                    break
-                            except Exception as e:
-                                log.warning(f"Failed to parse meta.json for {tid}: {e}")
-                # Fall back to cover art from a pending (not-yet-downloaded) track.
-                if not cover_art:
-                    for f in meta_files:
-                        try:
-                            meta = json.loads(f.read_text(encoding="utf-8"))
-                            cover_art = meta.get("art", "")
-                            if cover_art:
-                                break
-                        except Exception:
-                            pass
-                # "count" is the number of downloaded tracks; "pending" is the
-                # number of queued tracks whose audio hasn't landed yet.
-                pending_count = max(0, len(meta_files) - count)
-                entry_data = {
-                    "name": entry.name,
-                    "count": count,
-                    "coverArt": cover_art,
-                    "isAlbum": is_album,
-                    "albumId": album_meta.get("albumId", ""),
-                    "albumArtist": album_meta.get("artist", ""),
-                    "pending": pending_count,
-                }
-                if playlist_meta.get("source"):
-                    entry_data["source"] = playlist_meta["source"]
-                if playlist_meta.get("spotifyPlaylistId"):
-                    entry_data["spotifyPlaylistId"] = playlist_meta["spotifyPlaylistId"]
-                playlists.append(entry_data)
+            except OSError:
+                pass
+            if not cover_art:
+                cover_art = str(album_meta.get("art") or "")
+            if not cover_art:
+                ordered_meta = []
+                for audio in audio_files:
+                    ordered_meta.append(entry / f"{_tid_from_audio_filename(audio)}.meta.json")
+                ordered_meta.extend(meta_files)
+                seen = set()
+                for meta_path in ordered_meta:
+                    if meta_path in seen or not meta_path.exists():
+                        continue
+                    seen.add(meta_path)
+                    tid = meta_path.name[:-len(".meta.json")]
+                    cover_art = _read_track_meta(meta_path, tid).get("art", "")
+                    if cover_art:
+                        break
+            pending_count = sum(
+                1 for tid, meta in valid_meta.items()
+                if tid not in audio_tids and meta.get("downloadState") == "pending"
+            )
+            entry_data = {
+                "name": entry.name,
+                "count": count,
+                "downloaded": len(audio_tids),
+                "coverArt": cover_art,
+                "isAlbum": bool(album_meta),
+                "albumId": album_meta.get("albumId", ""),
+                "albumArtist": album_meta.get("artist", ""),
+                "pending": pending_count,
+            }
+            for key in ("source", "spotifyPlaylistId", "description"):
+                if playlist_meta.get(key):
+                    entry_data[key] = playlist_meta[key]
+            playlists.append(entry_data)
     return playlists
 
 def _get_playlist_index():
     global _playlist_index_cache
     with _playlist_index_lock:
-        if _playlist_index_cache is None:
-            _playlist_index_cache = _scan_playlists()
-        return _playlist_index_cache
+        cached = _playlist_index_cache
+        generation = _playlist_index_generation
+    if cached is not None:
+        return cached
+    # Never hold the cache lock while acquiring per-playlist locks. Writers
+    # invalidate the cache after releasing their playlist lock, which gives us
+    # one consistent lock order and avoids scan/write deadlocks.
+    scanned = _scan_playlists()
+    with _playlist_index_lock:
+        if _playlist_index_cache is None and generation == _playlist_index_generation:
+            _playlist_index_cache = scanned
+        return _playlist_index_cache if _playlist_index_cache is not None else scanned
 
 def _invalidate_playlist_cache():
-    global _playlist_index_cache
+    global _playlist_index_cache, _playlist_index_generation
     with _playlist_index_lock:
         _playlist_index_cache = None
+        _playlist_index_generation += 1
 
 @app.route("/api/playlists")
 def api_playlists():
@@ -2554,10 +4552,12 @@ def api_playlists_create():
     safe_name = _safe_playlist_name(raw_name)
     if not safe_name or not _validate_playlist_path(safe_name):
         return jsonify({"error": "Invalid playlist name"}), 400
-    target = PLAYLISTS_DIR / safe_name
-    if target.exists():
-        return jsonify({"error": "Playlist already exists"}), 409
-    target.mkdir(parents=True, exist_ok=True)
+    with _playlist_catalog_lock:
+        target = PLAYLISTS_DIR / safe_name
+        if target.exists():
+            return jsonify({"error": "Playlist already exists"}), 409
+        with _playlist_guard(safe_name):
+            target.mkdir(parents=True, exist_ok=False)
     _invalidate_playlist_cache()
     _invalidate_file_index()
     return jsonify({"success": True, "name": safe_name})
@@ -2569,18 +4569,287 @@ def api_playlists_add():
     track = data.get("track", {})
     track_number = data.get("trackNumber")
     album_data = data.get("albumData")
+    should_download = data.get("download", True) is not False
     safe_name = _safe_playlist_name(playlist)
     if not safe_name or not track:
         return jsonify({"error": "Missing playlist or track"}), 400
+    track = _normalize_playlist_track(track)
+    if not track:
+        return jsonify({"error": "Track name and artist are required"}), 400
+    track["downloadState"] = "pending" if should_download else "remote"
     if album_data:
         save_album_metadata(safe_name, album_data)
     # Write the meta.json synchronously so the playlist shows up as "pending"
     # immediately when the frontend re-fetches (before the async audio download).
-    _write_playlist_meta(track, safe_name, track_number)
-    _download_executor.submit(download_to_playlist, track, safe_name, track_number)
+    tid, created = _write_playlist_meta(track, safe_name, track_number)
+    if created and should_download:
+        _download_executor.submit(download_to_playlist, track, safe_name, track_number)
     _invalidate_playlist_cache()
     _invalidate_file_index()
-    return jsonify({"success": True, "playlist": safe_name})
+    return jsonify({"success": True, "playlist": safe_name, "tid": tid, "duplicate": not created})
+
+
+def _offline_job_snapshot(playlist_name: str) -> dict | None:
+    with _offline_collection_jobs_lock:
+        job = _offline_collection_jobs.get(playlist_name)
+        return dict(job) if job else None
+
+
+def _update_offline_job(playlist_name: str, **changes):
+    with _offline_collection_jobs_lock:
+        job = _offline_collection_jobs.get(playlist_name)
+        if job is not None:
+            job.update(changes)
+            _offline_collection_jobs.move_to_end(playlist_name)
+
+
+def _prepare_offline_playlist_tracks(playlist_name: str, tracks: list) -> list:
+    """Persist a complete collection without starting unbounded per-track jobs."""
+    prepared = []
+    pl_dir = PLAYLISTS_DIR / playlist_name
+    with _playlist_guard(playlist_name):
+        pl_dir.mkdir(parents=True, exist_ok=True)
+        local_tids = {
+            _tid_from_audio_filename(path)
+            for path in pl_dir.iterdir()
+            if path.suffix.lower() in _LOCAL_AUDIO_EXTENSIONS
+        }
+        used_numbers = _playlist_track_numbers_locked(pl_dir)
+        next_number = (max(used_numbers) if used_numbers else 0) + 1
+        seen_tids = set()
+        for index, raw_track in enumerate(tracks or []):
+            track = _normalize_playlist_track(raw_track)
+            if not track:
+                continue
+            tid = track.get("tid") or get_track_id(track.get("name", ""), track.get("artist", ""))
+            if not tid:
+                continue
+            if tid in seen_tids:
+                continue
+            seen_tids.add(tid)
+            track["tid"] = tid
+            requested_number = _coerce_track_number(raw_track.get("trackNumber")) or index + 1
+            number = requested_number
+            if number in used_numbers:
+                current_meta = _read_playlist_json(pl_dir / f"{tid}.meta.json", f"track metadata for {tid}") or {}
+                number = _coerce_track_number(current_meta.get("trackNumber")) or next_number
+            used_numbers.add(number)
+            next_number = max(next_number, number + 1)
+            meta_path = pl_dir / f"{tid}.meta.json"
+            existing = _read_playlist_json(meta_path, f"track metadata for {tid}") or {}
+            payload = _playlist_meta_payload(track, number, existing.get("addedAt") or time.time())
+            # Keep richer previously-resolved provider values when a sparse
+            # persisted playlist is sent back by the client.
+            for key, value in existing.items():
+                if key not in payload or not payload.get(key):
+                    payload[key] = value
+            payload["downloadState"] = "ready" if tid in local_tids else "pending"
+            payload["downloadError"] = ""
+            _atomic_write_json(meta_path, payload)
+            prepared.append(dict(track, trackNumber=number, downloadState=payload["downloadState"]))
+    _invalidate_playlist_cache()
+    _invalidate_file_index()
+    return prepared
+
+
+def _cache_offline_lyrics(track: dict) -> bool:
+    """Use the normal version-aware lyrics route so offline and live agree."""
+    try:
+        params = {
+            "title": track.get("name", ""),
+            "artist": track.get("artist", ""),
+            "videoId": track.get("videoId", ""),
+            "album": track.get("album") or track.get("albumName") or "",
+            "duration": track.get("dur") or track.get("duration") or "",
+        }
+        with app.test_request_context("/api/lyrics", query_string=params):
+            response = api_lyrics()
+            if isinstance(response, tuple):
+                response = response[0]
+            payload = response.get_json(silent=True) if hasattr(response, "get_json") else None
+        return bool(payload and payload.get("lines"))
+    except Exception as exc:
+        log.debug("Offline lyrics cache failed for %s: %s", track.get("name", "track"), exc)
+        return False
+
+
+def _cache_offline_track_assets(track: dict, playlist_name: str) -> dict:
+    return {
+        "art": _cache_playlist_track_art(track, playlist_name),
+        "lyrics": _cache_offline_lyrics(track),
+    }
+
+
+def _cache_offline_playlist_cover(playlist_name: str, cover_url: str) -> bool:
+    if not cover_url:
+        return False
+    pl_dir = PLAYLISTS_DIR / playlist_name
+    cover_path = pl_dir / "cover.jpg"
+    try:
+        if cover_path.exists() and cover_path.stat().st_size > 100:
+            return True
+        content, _working_url = _download_first_artwork([cover_url])
+        if not content:
+            return False
+        with _playlist_guard(playlist_name):
+            if not pl_dir.exists():
+                return False
+            temporary = cover_path.with_suffix(".jpg.tmp")
+            temporary.write_bytes(content)
+            os.replace(temporary, cover_path)
+        _invalidate_playlist_cache()
+        _invalidate_file_index()
+        return True
+    except Exception as exc:
+        log.debug("Offline collection cover failed for %s: %s", playlist_name, exc)
+        return False
+
+
+def _download_offline_collection(playlist_name: str, tracks: list, cover_url: str):
+    asset_futures = []
+    cover_future = _offline_asset_executor.submit(
+        _cache_offline_playlist_cover, playlist_name, cover_url
+    ) if cover_url else None
+    downloaded = failed = 0
+    errors = []
+    _update_offline_job(playlist_name, status="downloading", startedAt=time.time())
+    for index, track in enumerate(tracks):
+        title = str(track.get("name") or "Track")
+        _update_offline_job(playlist_name, current=title)
+        ok = download_to_playlist(
+            track, playlist_name, track.get("trackNumber") or index + 1, cache_art=False
+        )
+        if ok:
+            downloaded += 1
+            asset_futures.append(_offline_asset_executor.submit(
+                _cache_offline_track_assets, track, playlist_name
+            ))
+        else:
+            failed += 1
+            with _download_status_lock:
+                status = dict(_download_status.get(track.get("tid") or "", {}))
+            message = str(status.get("error") or "Download failed")[:180]
+            errors.append(f"{title}: {message}")
+        _update_offline_job(
+            playlist_name, processed=index + 1, downloaded=downloaded,
+            failed=failed, errors=errors[-8:],
+        )
+
+    _update_offline_job(playlist_name, status="assets", current="Saving covers and lyrics")
+    artwork = lyrics = assets_processed = 0
+    for future in asset_futures:
+        try:
+            result = future.result()
+            artwork += int(bool(result.get("art")))
+            lyrics += int(bool(result.get("lyrics")))
+        except Exception as exc:
+            log.debug("Offline asset worker failed: %s", exc)
+        assets_processed += 1
+        _update_offline_job(
+            playlist_name, assetsProcessed=assets_processed,
+            artwork=artwork, lyrics=lyrics,
+        )
+    cover_ready = False
+    if cover_future:
+        try:
+            cover_ready = bool(cover_future.result())
+        except Exception:
+            pass
+    _invalidate_playlist_cache()
+    _invalidate_file_index()
+    _update_offline_job(
+        playlist_name, status="complete", current="", cover=cover_ready,
+        artwork=artwork, lyrics=lyrics, finishedAt=time.time(),
+    )
+
+
+def _download_offline_collection_guarded(playlist_name: str, tracks: list, cover_url: str):
+    try:
+        _download_offline_collection(playlist_name, tracks, cover_url)
+    except Exception as exc:
+        log.exception("Offline collection worker failed for %s", playlist_name)
+        snapshot = _offline_job_snapshot(playlist_name) or {}
+        errors = list(snapshot.get("errors") or [])
+        errors.append(str(exc)[:180])
+        _update_offline_job(
+            playlist_name, status="complete", current="", finishedAt=time.time(),
+            failed=max(int(snapshot.get("failed") or 0), 1), errors=errors[-8:],
+        )
+
+
+@app.route("/api/playlists/offline", methods=["POST"])
+def api_playlists_offline():
+    data = request.get_json(force=True) or {}
+    requested_name = str(data.get("playlist") or "").strip()
+    safe_name = _safe_playlist_name(requested_name)
+    if not safe_name or not _validate_playlist_path(safe_name):
+        return jsonify({"error": "Invalid playlist name"}), 400
+    incoming_tracks = data.get("tracks")
+    if incoming_tracks is not None and not isinstance(incoming_tracks, list):
+        return jsonify({"error": "Tracks must be a list"}), 400
+    album_data = data.get("albumData") if isinstance(data.get("albumData"), dict) else None
+    existing_collection = bool(data.get("existing", True))
+
+    # A remote album may share a title with an unrelated playlist. Preserve the
+    # existing collection and allocate a distinct local album in that case.
+    with _playlist_catalog_lock:
+        target = PLAYLISTS_DIR / safe_name
+        if album_data and not existing_collection and target.exists():
+            current_album = _read_playlist_json(target / "album.json", "album metadata")
+            same_album = bool(
+                current_album and album_data.get("albumId") and
+                current_album.get("albumId") == album_data.get("albumId")
+            )
+            if not same_album:
+                safe_name = _unique_playlist_name_locked(safe_name)
+                target = PLAYLISTS_DIR / safe_name
+        with _playlist_guard(safe_name):
+            target.mkdir(parents=True, exist_ok=True)
+
+    tracks = incoming_tracks
+    if tracks is None:
+        tracks = _load_playlist_tracks(safe_name)
+    if not tracks:
+        return jsonify({"error": "This collection has no tracks"}), 400
+    prepared = _prepare_offline_playlist_tracks(safe_name, tracks)
+    if not prepared:
+        return jsonify({"error": "This collection has no valid tracks"}), 400
+    if album_data:
+        album_payload = dict(album_data, tracks=prepared)
+        save_album_metadata(safe_name, album_payload)
+
+    with _offline_collection_jobs_lock:
+        running = _offline_collection_jobs.get(safe_name)
+        if running and running.get("status") in {"queued", "downloading", "assets"}:
+            return jsonify(dict(running)), 202
+        while len(_offline_collection_jobs) >= _OFFLINE_COLLECTION_JOBS_MAX:
+            removable = next((key for key, job in _offline_collection_jobs.items()
+                              if job.get("status") == "complete"), None)
+            if removable is None:
+                break
+            _offline_collection_jobs.pop(removable, None)
+        job = {
+            "playlist": safe_name, "status": "queued", "total": len(prepared),
+            "processed": 0, "downloaded": 0, "failed": 0,
+            "assetsProcessed": 0, "artwork": 0, "lyrics": 0,
+            "cover": False, "current": "", "errors": [], "createdAt": time.time(),
+        }
+        _offline_collection_jobs[safe_name] = job
+    _offline_collection_executor.submit(
+        _download_offline_collection_guarded, safe_name, prepared, str(data.get("coverUrl") or "")
+    )
+    return jsonify(dict(job)), 202
+
+
+@app.route("/api/playlists/offline/status")
+def api_playlists_offline_status():
+    safe_name = _safe_playlist_name(request.args.get("playlist", ""))
+    if not safe_name or not _validate_playlist_path(safe_name):
+        return jsonify({"error": "Invalid playlist name"}), 400
+    job = _offline_job_snapshot(safe_name)
+    if not job:
+        return jsonify({"playlist": safe_name, "status": "idle"})
+    return jsonify(job)
 
 
 @app.route("/api/playlists/cover", methods=["POST"])
@@ -2598,12 +4867,17 @@ def api_playlists_cover():
     pl_dir.mkdir(parents=True, exist_ok=True)
     cover_path = pl_dir / "cover.jpg"
     try:
-        r = requests.get(cover_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if r.ok and len(r.content) > 100:
-            cover_path.write_bytes(r.content)
+        content, working_url = _download_first_artwork([cover_url])
+        if content:
+            with _playlist_guard(safe_name):
+                if not pl_dir.exists():
+                    return jsonify({"error": "Playlist was removed"}), 409
+                tmp_cover = cover_path.with_suffix(".jpg.tmp")
+                tmp_cover.write_bytes(content)
+                os.replace(tmp_cover, cover_path)
             _invalidate_playlist_cache()
-            return jsonify({"success": True})
-        return jsonify({"error": f"Failed to download cover (HTTP {r.status_code})"}), 502
+            return jsonify({"success": True, "source": working_url})
+        return jsonify({"error": "Failed to download a valid playlist cover"}), 502
     except Exception as e:
         log.warning(f"[PLAYLISTS] Cover download failed: {e}")
         return jsonify({"error": f"Download failed: {e}"}), 502
@@ -2619,15 +4893,16 @@ def api_playlists_metadata():
         return jsonify({"error": "Missing playlist"}), 400
     if not _validate_playlist_path(safe_name):
         return jsonify({"error": "Invalid playlist name"}), 400
-    pl_dir = PLAYLISTS_DIR / safe_name
-    pl_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = pl_dir / "playlist.json"
     meta = {}
     for key in ("source", "spotifyPlaylistId", "description"):
         if key in data:
             meta[key] = data[key]
     try:
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _playlist_catalog_lock:
+            with _playlist_guard(safe_name):
+                pl_dir = PLAYLISTS_DIR / safe_name
+                pl_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_write_json(pl_dir / "playlist.json", meta)
         _invalidate_playlist_cache()
         return jsonify({"success": True})
     except Exception as e:
@@ -2636,10 +4911,10 @@ def api_playlists_metadata():
 
 @app.route("/api/playlists/enrich_artwork", methods=["POST"])
 def api_playlists_enrich_artwork():
-    """Batch-enrich artwork for all tracks in a playlist via iTunes.
-    Runs in a background thread so the frontend can poll progress."""
+    """Start one deduplicated artwork-resolution job for a playlist."""
     data = request.get_json(force=True) or {}
     playlist = data.get("playlist", "")
+    force = bool(data.get("force"))
     safe_name = _safe_playlist_name(playlist)
     if not safe_name or not _validate_playlist_path(safe_name):
         return jsonify({"error": "Invalid playlist"}), 400
@@ -2647,78 +4922,127 @@ def api_playlists_enrich_artwork():
     if not pl_dir.exists():
         return jsonify({"error": "Playlist not found"}), 404
 
-    def _enrich_worker():
-        meta_files = sorted(f for f in pl_dir.iterdir() if f.name.endswith(".meta.json"))
-        print(f"[ENRICH] Starting artwork enrichment for {safe_name}: {len(meta_files)} tracks", flush=True)
-        enriched_count = 0
+    with _artwork_jobs_lock:
+        existing = _artwork_jobs.get(safe_name)
+        if existing and existing.get("status") in ("queued", "running"):
+            return jsonify(dict(existing)), 202
+        job = {
+            "playlist": safe_name, "status": "queued", "total": 0,
+            "processed": 0, "resolved": 0, "downloaded": 0,
+            "missing": 0, "startedAt": time.time(), "finishedAt": 0,
+        }
+        _artwork_jobs[safe_name] = job
+        _artwork_jobs.move_to_end(safe_name)
+        while len(_artwork_jobs) > _ARTWORK_JOBS_MAX:
+            _artwork_jobs.popitem(last=False)
 
-        # Stage filter + shape — only tracks missing mzstatic.com iTunes art
-        # go through the ISRC-first pipeline; anything already resolved is
-        # left untouched so enrichment is idempotent across re-runs.
-        pending: list[tuple] = []  # (meta_path, meta_dict, art_before)
-        for mf in meta_files:
-            try:
-                meta = json.loads(mf.read_text(encoding="utf-8"))
-            except Exception as e:
-                log.warning(f"Artwork enrichment read failed for {mf.name}: {e}")
+    def _set_job(**updates):
+        with _artwork_jobs_lock:
+            current = _artwork_jobs.setdefault(safe_name, {"playlist": safe_name})
+            current.update(updates)
+
+    def _enrich_worker():
+        _set_job(status="running")
+        with _playlist_guard(safe_name):
+            if not pl_dir.exists():
+                _set_job(status="failed", error="Playlist was removed", finishedAt=time.time())
+                return
+            meta_files = sorted(f for f in pl_dir.iterdir() if f.name.endswith(".meta.json"))
+            meta_snapshot = [(mf, _read_playlist_json(mf, f"track metadata for {mf.name}")) for mf in meta_files]
+        print(f"[ENRICH] Starting artwork enrichment for {safe_name}: {len(meta_files)} tracks", flush=True)
+        pending: list[tuple] = []
+        for mf, meta in meta_snapshot:
+            if not meta:
                 continue
-            art = meta.get("art", "") or meta.get("album_art", "")
-            if art and "mzstatic.com" in art:
+            existing_candidates = meta.get("art_candidates") if isinstance(meta.get("art_candidates"), list) else []
+            if meta.get("art_resolved_at") and len(existing_candidates) >= 2:
                 continue
-            pending.append((mf, meta, art))
+            pending.append((mf, meta, meta.get("art", "") or meta.get("album_art", "")))
+
+        _set_job(total=len(pending))
 
         if not pending:
-            print(f"[ENRICH] {safe_name}: nothing to do (all tracks already have iTunes art)", flush=True)
-            _invalidate_file_index()
-            _invalidate_playlist_cache()
+            _set_job(status="complete", finishedAt=time.time())
             return
 
-        # Build uniform batch payload for artwork_fetcher. Every track dict
-        # entering the pipeline carries the exact same key set — no deferrals
-        # to a separate codepath, no shape-sniffing inside the fetcher.
-        batch = []
-        for _mf, meta, _art in pending:
-            batch.append({
-                "name": meta.get("name", ""),
-                "artist": meta.get("artist", ""),
-                "art": meta.get("art", ""),
-                "album_art": meta.get("album_art", meta.get("art", "")),
-                "spotify_image_url": meta.get("spotify_image_url", ""),
-            })
-
-        af = _ensure_artwork_fetcher()
-        results = af.fetch_artwork_batch(batch)
-
-        # Persist results + download artwork files (sequential; cheap I/O).
+        results = resolve_artwork_batch([meta for _mf, meta, _art in pending], force=force)
+        resolved_count = downloaded_count = missing_count = 0
         for (mf, meta, art_before), enriched in zip(pending, results):
             try:
                 new_art = enriched.get("art") or enriched.get("album_art", "")
-                if not new_art or new_art == art_before:
-                    continue
-                meta["art"] = new_art
-                meta["album_art"] = new_art
-                if enriched.get("spotify_image_url"):
-                    meta["spotify_image_url"] = enriched["spotify_image_url"]
-                mf.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
                 tid = mf.stem.replace(".meta", "")
                 art_path = pl_dir / f"{tid}.jpg"
-                if not art_path.exists() and new_art.startswith(("https://", "http://")):
-                    try:
-                        r = requests.get(new_art, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                        if r.ok:
-                            art_path.write_bytes(r.content)
-                    except Exception:
-                        pass
-                enriched_count += 1
-                print(f"[ENRICH] {safe_name}: {meta.get('name', tid)} -> {new_art[:80]}", flush=True)
+                candidates = enriched.get("art_candidates") or ([new_art] if new_art else [])
+                art_bytes, working_url = (None, "") if art_path.exists() else _download_first_artwork(candidates)
+                if working_url:
+                    new_art = working_url
+                with _playlist_guard(safe_name):
+                    if not pl_dir.exists() or not mf.exists():
+                        continue
+                    current = _read_playlist_json(mf, f"track metadata for {mf.name}")
+                    if not current:
+                        continue
+                    if new_art:
+                        current["art"] = new_art
+                        current["album_art"] = new_art
+                    current["art_candidates"] = candidates
+                    current["art_source"] = enriched.get("art_source", "")
+                    current["art_confidence"] = enriched.get("art_confidence", 0)
+                    if enriched.get("videoId"):
+                        current["videoId"] = enriched["videoId"]
+                    if enriched.get("album"):
+                        current["album"] = enriched["album"]
+                    if enriched.get("albumId"):
+                        current["albumId"] = enriched["albumId"]
+                    if enriched.get("recording_confidence"):
+                        current["recording_confidence"] = enriched["recording_confidence"]
+                    current["art_resolved_at"] = time.time()
+                    _atomic_write_json(mf, current)
+                    if art_bytes and not art_path.exists():
+                        tmp_art = art_path.with_suffix(".jpg.tmp")
+                        tmp_art.write_bytes(art_bytes)
+                        os.replace(tmp_art, art_path)
+                if new_art:
+                    resolved_count += 1
+                else:
+                    missing_count += 1
+                if art_bytes:
+                    downloaded_count += 1
+                _set_job(
+                    processed=resolved_count + missing_count, resolved=resolved_count,
+                    downloaded=downloaded_count, missing=missing_count,
+                )
             except Exception as e:
                 log.warning(f"Artwork enrichment failed for {mf.name}: {e}")
+                missing_count += 1
+                _set_job(processed=resolved_count + missing_count, missing=missing_count)
         _invalidate_file_index()
         _invalidate_playlist_cache()
-        print(f"[ENRICH] Done for {safe_name}: {enriched_count}/{len(pending)} tracks updated", flush=True)
+        _set_job(
+            status="complete", processed=len(pending), resolved=resolved_count,
+            downloaded=downloaded_count, missing=missing_count, finishedAt=time.time(),
+        )
+        print(f"[ENRICH] Done for {safe_name}: {resolved_count}/{len(pending)} resolved", flush=True)
 
-    _download_executor.submit(_enrich_worker)
-    return jsonify({"success": True, "message": "Artwork enrichment started"})
+    def _run_enrich_worker():
+        try:
+            _enrich_worker()
+        except Exception as exc:
+            log.warning(f"Artwork enrichment job failed for {safe_name}: {exc}")
+            _set_job(status="failed", error=str(exc), finishedAt=time.time())
+
+    _artwork_executor.submit(_run_enrich_worker)
+    return jsonify(dict(job)), 202
+
+
+@app.route("/api/playlists/enrich_artwork/status")
+def api_playlists_enrich_artwork_status():
+    safe_name = _safe_playlist_name(request.args.get("playlist", ""))
+    if not safe_name:
+        return jsonify({"error": "Invalid playlist"}), 400
+    with _artwork_jobs_lock:
+        job = _artwork_jobs.get(safe_name)
+        return jsonify(dict(job) if job else {"playlist": safe_name, "status": "idle"})
 
 
 _MP3_BITRATES = {
@@ -2788,41 +5112,22 @@ def _mp3_duration_seconds(path) -> float | None:
     return None
 
 
-@app.route("/api/playlists/tracks")
-def api_playlists_tracks():
-    playlist = request.args.get("name", "")
-    safe_name = _safe_playlist_name(playlist)
-    _burst_check("playlists_tracks", safe_name)
+def _load_playlist_tracks_unlocked(safe_name: str) -> list:
     pl_dir = PLAYLISTS_DIR / safe_name
     if not pl_dir.exists():
-        return jsonify([])
-    # Collect every tid that already has a downloaded .mp3.
-    have_mp3 = set()
+        return []
+    # Android keeps native m4a/webm/opus containers, while desktop normally
+    # stores mp3. Treat every supported local audio suffix identically.
+    have_audio = set()
     for f in pl_dir.iterdir():
-        if f.suffix == ".mp3":
-            stem = f.stem
-            if " - " in stem:
-                prefix = stem.split(" - ", 1)[0]
-                if prefix.isdigit():
-                    tid = stem.split(" - ", 1)[1]
-                else:
-                    tid = stem
-            else:
-                tid = stem
-            have_mp3.add(tid)
+        if f.suffix.lower() in _LOCAL_AUDIO_EXTENSIONS:
+            tid = _tid_from_audio_filename(f)
+            have_audio.add(tid)
     tracks = []
     # 1) Downloaded tracks
     for f in sorted(pl_dir.iterdir()):
-        if f.suffix == ".mp3" and f.stem and not f.stem.startswith("."):
-            stem = f.stem
-            if " - " in stem:
-                prefix = stem.split(" - ", 1)[0]
-                if prefix.isdigit():
-                    tid = stem.split(" - ", 1)[1]
-                else:
-                    tid = stem
-            else:
-                tid = stem
+        if f.suffix.lower() in _LOCAL_AUDIO_EXTENSIONS and f.stem and not f.stem.startswith("."):
+            tid = _tid_from_audio_filename(f)
             art_file = pl_dir / f"{tid}.jpg"
             meta_file = pl_dir / f"{tid}.meta.json"
             name = tid
@@ -2832,8 +5137,8 @@ def api_playlists_tracks():
             track_number = 999
             added_at = f.stat().st_mtime if hasattr(f, "stat") and f.exists() else 0
             if meta_file.exists():
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                meta = _read_track_meta(meta_file, tid)
+                if meta:
                     name = meta.get("name", tid)
                     artist = meta.get("artist", "Unknown Artist")
                     dur = meta.get("dur", 0)
@@ -2843,8 +5148,6 @@ def api_playlists_tracks():
                         added_at = meta["addedAt"]
                     else:
                         added_at = meta_file.stat().st_mtime
-                except Exception:
-                    pass
             # Backfill real MP3 duration when the stored one is missing/zero so
             # playlist totals add up correctly (persisted back into meta.json).
             if (not dur or dur <= 0) and f.exists():
@@ -2853,9 +5156,9 @@ def api_playlists_tracks():
                     dur = int(round(real_dur))
                     try:
                         if meta_file.exists():
-                            _m = json.loads(meta_file.read_text(encoding="utf-8"))
+                            _m = _read_playlist_json(meta_file, f"track metadata for {tid}")
                             _m["dur"] = dur
-                            meta_file.write_text(json.dumps(_m, ensure_ascii=False), encoding="utf-8")
+                            _atomic_write_json(meta_file, _m)
                     except Exception:
                         pass
             tracks.append({
@@ -2864,6 +5167,14 @@ def api_playlists_tracks():
                 "tid": tid,
                 "dur": dur,
                 "art": art,
+                "videoId": meta.get("videoId", "") if meta_file.exists() and meta else "",
+                "albumId": meta.get("albumId", "") if meta_file.exists() and meta else "",
+                "album": meta.get("album", "") if meta_file.exists() and meta else "",
+                "albumName": meta.get("albumName", "") if meta_file.exists() and meta else "",
+                "art_candidates": meta.get("art_candidates", []) if meta_file.exists() and meta else [],
+                "art_source": meta.get("art_source", "") if meta_file.exists() and meta else "",
+                "art_confidence": meta.get("art_confidence", 0) if meta_file.exists() and meta else 0,
+                "art_resolved_at": meta.get("art_resolved_at", 0) if meta_file.exists() and meta else 0,
                 "trackNumber": track_number,
                 "dateAdded": added_at,
                 "local_audio": True,
@@ -2875,11 +5186,10 @@ def api_playlists_tracks():
     for f in sorted(pl_dir.iterdir()):
         if f.name.endswith(".meta.json") and f.stem and not f.stem.startswith("."):
             tid = f.stem[:-len(".meta")] if f.stem.endswith(".meta") else f.stem
-            if tid in have_mp3:
+            if tid in have_audio:
                 continue
-            try:
-                meta = json.loads(f.read_text(encoding="utf-8"))
-            except Exception:
+            meta = _read_track_meta(f, tid)
+            if not meta:
                 continue
             name = meta.get("name", tid)
             artist = meta.get("artist", "Unknown Artist")
@@ -2888,6 +5198,7 @@ def api_playlists_tracks():
             track_number = meta.get("trackNumber", 999)
             added_at = meta.get("addedAt") or f.stat().st_mtime
             art_file = pl_dir / f"{tid}.jpg"
+            is_pending = meta.get("downloadState") != "remote"
             tracks.append({
                 "name": name,
                 "artist": artist,
@@ -2897,14 +5208,270 @@ def api_playlists_tracks():
                 "trackNumber": track_number,
                 "dateAdded": added_at,
                 "videoId": meta.get("videoId", ""),
+                "albumId": meta.get("albumId", ""),
+                "album": meta.get("album", ""),
+                "albumName": meta.get("albumName", ""),
+                "art_candidates": meta.get("art_candidates", []),
+                "art_source": meta.get("art_source", ""),
+                "art_confidence": meta.get("art_confidence", 0),
+                "art_resolved_at": meta.get("art_resolved_at", 0),
                 "local_audio": False,
                 "local_art": art_file.exists(),
                 "playlist": safe_name,
-                "pending": True,
+                "pending": is_pending,
+                "remote_only": not is_pending,
             })
-            have_mp3.add(tid)  # avoid double-counting if stem parsing was ambiguous
+            have_audio.add(tid)  # avoid double-counting if stem parsing was ambiguous
     tracks.sort(key=lambda x: x.get("trackNumber") or 999)
-    return jsonify(tracks)
+    return tracks
+
+
+def _load_playlist_tracks(safe_name: str) -> list:
+    with _playlist_guard(safe_name):
+        return _load_playlist_tracks_unlocked(safe_name)
+
+
+@app.route("/api/playlists/tracks")
+def api_playlists_tracks():
+    safe_name = _safe_playlist_name(request.args.get("name", ""))
+    if not safe_name or not _validate_playlist_path(safe_name):
+        return jsonify([])
+    _burst_check("playlists_tracks", safe_name)
+    return jsonify(_load_playlist_tracks(safe_name))
+
+
+_PLAYLIST_EXPORT_SCHEMA = "akimelody-playlist"
+_PLAYLIST_EXPORT_VERSION = 1
+_PLAYLIST_IMPORT_MAX_TRACKS = 5000
+
+
+def _playlist_export_track(track: dict) -> dict:
+    return {
+        "name": track.get("name", ""),
+        "artist": track.get("artist", ""),
+        "tid": get_track_id(track.get("name", ""), track.get("artist", "")),
+        "dur": _coerce_playlist_duration(track.get("dur")),
+        "art": track.get("art", ""),
+        "videoId": track.get("videoId", ""),
+        "albumId": track.get("albumId", ""),
+        "album": track.get("album") or track.get("albumName") or "",
+        "art_candidates": track.get("art_candidates") or [],
+        "art_source": track.get("art_source", ""),
+        "trackNumber": _coerce_track_number(track.get("trackNumber")),
+        "dateAdded": track.get("dateAdded", 0),
+        "localAudio": bool(track.get("local_audio")),
+    }
+
+
+def _playlist_export_document(safe_name: str) -> dict | None:
+    with _playlist_guard(safe_name):
+        pl_dir = PLAYLISTS_DIR / safe_name
+        if not pl_dir.exists():
+            return None
+        tracks = _load_playlist_tracks_unlocked(safe_name)
+        playlist_meta = _read_playlist_json(pl_dir / "playlist.json", "playlist metadata")
+        album_meta = _read_playlist_json(pl_dir / "album.json", "album metadata")
+        return {
+            "schema": _PLAYLIST_EXPORT_SCHEMA,
+            "version": _PLAYLIST_EXPORT_VERSION,
+            "exportedAt": int(time.time()),
+            "appVersion": APP_VERSION,
+            "playlist": {
+                "name": safe_name,
+                "description": str(playlist_meta.get("description") or "")[:2000],
+                "source": str(playlist_meta.get("source") or "")[:128],
+                "isAlbum": bool(album_meta),
+            },
+        "tracks": [
+            _playlist_export_track(_merge_track_meta_extras(pl_dir / f"{track['tid']}.meta.json", track))
+            for track in tracks
+        ],
+        }
+
+
+def _playlist_m3u_document(safe_name: str) -> str | None:
+    with _playlist_guard(safe_name):
+        if not (PLAYLISTS_DIR / safe_name).exists():
+            return None
+        tracks = _load_playlist_tracks_unlocked(safe_name)
+    lines = ["#EXTM3U", f"#PLAYLIST:{safe_name}"]
+    for track in tracks:
+        duration = _coerce_playlist_duration(track.get("dur")) or -1
+        label = f"{track.get('artist', 'Unknown Artist')} - {track.get('name', 'Unknown')}".replace("\r", " ").replace("\n", " ")
+        lines.append(f"#EXTINF:{duration},{label}")
+        if track.get("videoId"):
+            lines.append(f"https://music.youtube.com/watch?v={urllib.parse.quote(str(track['videoId']), safe='')}")
+        elif track.get("local_audio"):
+            query = urllib.parse.urlencode({
+                "tid": track.get("tid", ""),
+                "name": track.get("name", ""),
+                "artist": track.get("artist", ""),
+            })
+            lines.append(f"http://127.0.0.1:{SERVER_PORT}/api/stream?{query}")
+        else:
+            lines.append(f"ytsearch1:{urllib.parse.quote_plus(label + ' audio')}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_playlist_import_document(data) -> tuple[dict | None, str | None]:
+    if not isinstance(data, dict):
+        return None, "Import file must contain a JSON object"
+    if data.get("schema") != _PLAYLIST_EXPORT_SCHEMA:
+        return None, "This is not an AkiMelody playlist export"
+    if data.get("version") != _PLAYLIST_EXPORT_VERSION:
+        return None, f"Unsupported playlist version: {data.get('version')}"
+    playlist = data.get("playlist")
+    tracks = data.get("tracks")
+    if not isinstance(playlist, dict) or not isinstance(tracks, list):
+        return None, "Playlist export is missing playlist or track data"
+    if len(tracks) > _PLAYLIST_IMPORT_MAX_TRACKS:
+        return None, f"Playlist contains more than {_PLAYLIST_IMPORT_MAX_TRACKS} tracks"
+    requested_name = _safe_playlist_name(str(playlist.get("name") or "Imported Playlist"))
+    normalized = []
+    invalid = []
+    duplicates_in_file = []
+    seen = set()
+    for index, raw_track in enumerate(tracks):
+        track = _normalize_playlist_track(raw_track)
+        if not track:
+            invalid.append(index + 1)
+            continue
+        if track["tid"] in seen:
+            duplicates_in_file.append(index + 1)
+            continue
+        seen.add(track["tid"])
+        track["trackNumber"] = len(normalized) + 1
+        track["downloadState"] = "remote"
+        normalized.append(track)
+    return {
+        "requestedName": requested_name,
+        "description": str(playlist.get("description") or "")[:2000],
+        "source": str(playlist.get("source") or "import")[:128] or "import",
+        "tracks": normalized,
+        "invalidRows": invalid,
+        "duplicateRows": duplicates_in_file,
+    }, None
+
+
+def _playlist_import_preview(parsed: dict, mode: str, requested_name: str | None = None) -> dict:
+    base_name = _safe_playlist_name(requested_name or parsed["requestedName"])
+    with _playlist_catalog_lock:
+        exists = (PLAYLISTS_DIR / base_name).exists()
+        target_name = _unique_playlist_name_locked(base_name) if mode == "copy" and exists else base_name
+        existing_tids = set()
+        if mode == "merge" and exists:
+            with _playlist_guard(base_name):
+                existing_tids = _playlist_existing_tids_locked(PLAYLISTS_DIR / base_name)
+    duplicate_existing = [track["tid"] for track in parsed["tracks"] if track["tid"] in existing_tids]
+    return {
+        "valid": True,
+        "requestedName": base_name,
+        "targetName": target_name,
+        "nameConflict": exists,
+        "mode": mode,
+        "totalRows": len(parsed["tracks"]) + len(parsed["invalidRows"]) + len(parsed["duplicateRows"]),
+        "validTracks": len(parsed["tracks"]),
+        "newTracks": len(parsed["tracks"]) - len(duplicate_existing),
+        "duplicateInFile": len(parsed["duplicateRows"]),
+        "duplicateExisting": len(duplicate_existing),
+        "invalidTracks": len(parsed["invalidRows"]),
+        "downloadNote": "Imported tracks stream normally; audio downloads are not included in the export.",
+    }
+
+
+@app.route("/api/playlists/export")
+def api_playlists_export():
+    safe_name = _safe_playlist_name(request.args.get("name", ""))
+    export_format = str(request.args.get("format") or "json").lower()
+    if not safe_name or not _validate_playlist_path(safe_name):
+        return jsonify({"error": "Invalid playlist name"}), 400
+    if export_format == "m3u":
+        body = _playlist_m3u_document(safe_name)
+        mimetype, extension = "audio/x-mpegurl", "m3u"
+    else:
+        document = _playlist_export_document(safe_name)
+        body = json.dumps(document, ensure_ascii=False, indent=2) if document else None
+        mimetype, extension = "application/json", "akiplaylist.json"
+    if body is None:
+        return jsonify({"error": "Playlist not found"}), 404
+    response = Response(body, mimetype=mimetype)
+    filename = safe_filename_component(safe_name, fallback="playlist") + "." + extension
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/playlists/import/preview", methods=["POST"])
+def api_playlists_import_preview():
+    data = request.get_json(force=True) or {}
+    parsed, error = _parse_playlist_import_document(data.get("document"))
+    if error:
+        return jsonify({"valid": False, "error": error}), 400
+    mode = "merge" if data.get("mode") == "merge" else "copy"
+    return jsonify(_playlist_import_preview(parsed, mode, data.get("name")))
+
+
+@app.route("/api/playlists/import", methods=["POST"])
+def api_playlists_import():
+    data = request.get_json(force=True) or {}
+    parsed, error = _parse_playlist_import_document(data.get("document"))
+    if error:
+        return jsonify({"error": error}), 400
+    if not parsed["tracks"]:
+        return jsonify({"error": "Playlist contains no valid tracks"}), 400
+    mode = "merge" if data.get("mode") == "merge" else "copy"
+    requested_name = _safe_playlist_name(str(data.get("name") or parsed["requestedName"]))
+    if not requested_name or not _validate_playlist_path(requested_name):
+        return jsonify({"error": "Invalid playlist name"}), 400
+    return jsonify(_apply_playlist_import(parsed, mode, requested_name))
+
+
+def _apply_playlist_import(parsed: dict, mode: str, requested_name: str) -> dict:
+    """Apply an already validated import under catalog + playlist locks."""
+    with _playlist_catalog_lock:
+        exists = (PLAYLISTS_DIR / requested_name).exists()
+        if mode == "merge":
+            target_name = requested_name
+        else:
+            target_name = _unique_playlist_name_locked(requested_name) if exists else requested_name
+        with _playlist_guard(target_name):
+            pl_dir = PLAYLISTS_DIR / target_name
+            pl_dir.mkdir(parents=True, exist_ok=True)
+            existing = _playlist_existing_tids_locked(pl_dir)
+            next_number = _next_playlist_track_number_locked(pl_dir)
+            added = 0
+            duplicate_existing = 0
+            for track in parsed["tracks"]:
+                if track["tid"] in existing:
+                    duplicate_existing += 1
+                    continue
+                track_number = next_number if mode == "merge" else added + 1
+                _atomic_write_json(
+                    pl_dir / f"{track['tid']}.meta.json",
+                    _playlist_meta_payload(track, track_number),
+                )
+                existing.add(track["tid"])
+                next_number += 1
+                added += 1
+            playlist_meta = _read_playlist_json(pl_dir / "playlist.json", "playlist metadata")
+            playlist_meta.update({
+                "source": parsed["source"] or "import",
+                "description": parsed["description"],
+                "importedAt": int(time.time()),
+                "importSchema": _PLAYLIST_EXPORT_SCHEMA,
+                "importVersion": _PLAYLIST_EXPORT_VERSION,
+            })
+            _atomic_write_json(pl_dir / "playlist.json", playlist_meta)
+    _invalidate_playlist_cache()
+    _invalidate_file_index()
+    return {
+        "success": True,
+        "name": target_name,
+        "mode": mode,
+        "added": added,
+        "duplicates": duplicate_existing + len(parsed["duplicateRows"]),
+        "invalid": len(parsed["invalidRows"]),
+    }
 
 @app.route("/api/library_file")
 def api_library_file():
@@ -2916,7 +5483,13 @@ def api_library_file():
     idx = _get_file_index()
     matched = idx.get(filename)
     if matched and matched.is_file():
-        return send_from_directory(str(matched.parent), filename)
+        response = send_from_directory(
+            str(matched.parent), matched.name, conditional=True, mimetype=_local_media_mimetype(matched)
+        )
+        response.headers.setdefault("Accept-Ranges", "bytes")
+        response.headers.setdefault("Cache-Control", "private, no-cache")
+        response.headers["X-Aki-Local"] = "library"
+        return response
     return jsonify({"error": "Not found"}), 404
 
 @app.route("/api/settings")
@@ -3009,22 +5582,306 @@ def api_refresh_youtube_auth():
         return jsonify({"success": True, "message": "YouTube auth refreshed"})
     return jsonify({"success": False, "message": "No valid cookies found"}), 400
 
+
+def _safe_cookie_header_pairs(header: str) -> list[tuple[str, str]]:
+    """Parse a native CookieManager header without accepting control data."""
+    pairs = []
+    for item in str(header or "")[:32768].split(";"):
+        if "=" not in item:
+            continue
+        name, value = item.strip().split("=", 1)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+            continue
+        if not value or len(value) > 4096 or any(ord(char) < 32 for char in value):
+            continue
+        pairs.append((name, value))
+    return pairs
+
+
+@app.route("/api/youtube/import_cookies", methods=["POST"])
+def api_youtube_import_cookies():
+    """Persist cookies captured by the app-private Android login WebView."""
+    global ytmusic, _auth_state_ok
+    if not IS_ANDROID:
+        return jsonify({"error": "Native cookie import is only available in the Android app"}), 400
+    data = request.get_json(silent=True) or {}
+    sources = (
+        (".youtube.com", _safe_cookie_header_pairs(data.get("youtube", ""))),
+        (".google.com", _safe_cookie_header_pairs(data.get("google", ""))),
+    )
+    youtube_names = {name for name, _value in sources[0][1]}
+    if "SAPISID" not in youtube_names or not ({"SID", "__Secure-1PSID", "__Secure-3PSID"} & youtube_names):
+        return jsonify({
+            "error": "YouTube Music has not finished creating its session yet",
+            "missing": [name for name in ("SAPISID", "SID") if name not in youtube_names],
+        }), 400
+
+    lines = ["# Netscape HTTP Cookie File", "# Captured locally by AkiMelody Android"]
+    seen = set()
+    for domain, pairs in sources:
+        for name, value in pairs:
+            key = (domain, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"{domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+    temporary = _yt_cookie_file.with_suffix(".txt.tmp")
+    try:
+        # This explicit browser sign-in replaces any older device-code token.
+        # Otherwise _init_ytmusic would continue preferring OAuth and the newly
+        # captured cookies would never actually back account-library requests.
+        try:
+            _yt_oauth_file.unlink(missing_ok=True)
+            yauth.clear_auth()
+        except Exception as exc:
+            log.debug("Old YouTube auth cleanup was incomplete: %s", exc)
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(temporary, _yt_cookie_file)
+        if not _generate_auth_headers(_yt_cookie_file.read_text(encoding="utf-8")):
+            raise RuntimeError("Captured cookies could not create YouTube Music authorization")
+        _auth_state_ok = True
+        ytmusic = _init_ytmusic()
+        verification = _fetch_youtube_likes_raw(1, timeout=18)
+        if not isinstance(verification, dict):
+            raise RuntimeError("YouTube Music did not return an account library")
+        with _liked_lock:
+            _liked_cache.clear()
+        _invalidate_stream_cache()
+        return jsonify({
+            "authenticated": True, "cookies": len(seen),
+            "library_verified": True,
+        })
+    except Exception as exc:
+        _auth_state_ok = False
+        return jsonify({"error": str(exc)}), 502
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _save_youtube_oauth_credentials(client_id: str, client_secret: str) -> dict:
+    credentials = {
+        "client_id": str(client_id or "").strip(),
+        "client_secret": str(client_secret or "").strip(),
+    }
+    if len(credentials["client_id"]) < 20 or len(credentials["client_secret"]) < 8:
+        raise ValueError("A valid YouTube OAuth client ID and secret are required")
+    _atomic_write_json(_yt_oauth_credentials_file, credentials)
+    return credentials
+
+
+@app.route("/api/youtube/oauth/device", methods=["POST"])
+def api_youtube_oauth_device():
+    """Begin Google's device authorization flow entirely on this device.
+
+    Google blocks account sign-in inside embedded WebViews. Device authorization
+    keeps the consent page in the phone's trusted browser while the local Flask
+    process receives and stores the resulting refreshable token.
+    """
+    data = request.get_json(silent=True) or {}
+    client_id = str(data.get("client_id") or "").strip()
+    client_secret = str(data.get("client_secret") or "").strip()
+    try:
+        credentials = (
+            _save_youtube_oauth_credentials(client_id, client_secret)
+            if client_id or client_secret
+            else _load_youtube_oauth_credentials()
+        )
+    except ValueError as error:
+        return jsonify({"error": str(error), "needs_credentials": True}), 400
+    if not credentials:
+        return jsonify({
+            "error": "Enter a YouTube Data API OAuth client ID and secret to connect on this phone",
+            "needs_credentials": True,
+        }), 400
+
+    try:
+        response = requests.post(
+            _YOUTUBE_DEVICE_CODE_URL,
+            data={"client_id": credentials["client_id"], "scope": _YOUTUBE_OAUTH_SCOPE},
+            timeout=12,
+        )
+        payload = response.json()
+    except Exception as error:
+        return jsonify({"error": f"Could not start YouTube sign-in: {error}"}), 502
+    if not response.ok or not payload.get("device_code"):
+        message = payload.get("error_description") or payload.get("error") or "YouTube rejected the sign-in request"
+        return jsonify({"error": message}), 502
+
+    flow_id = secrets.token_urlsafe(24)
+    interval = max(5, int(payload.get("interval") or 5))
+    with _youtube_oauth_lock:
+        now = time.time()
+        for key in list(_youtube_oauth_pending):
+            if _youtube_oauth_pending[key].get("expires_at", 0) <= now:
+                _youtube_oauth_pending.pop(key, None)
+        _youtube_oauth_pending[flow_id] = {
+            "device_code": payload["device_code"],
+            "client_id": credentials["client_id"],
+            "client_secret": credentials["client_secret"],
+            "interval": interval,
+            "next_poll": 0.0,
+            "expires_at": now + int(payload.get("expires_in") or 900),
+        }
+        while len(_youtube_oauth_pending) > _YOUTUBE_OAUTH_PENDING_MAX:
+            _youtube_oauth_pending.popitem(last=False)
+    return jsonify({
+        "flow_id": flow_id,
+        "user_code": payload.get("user_code", ""),
+        "verification_url": payload.get("verification_url") or payload.get("verification_uri") or "https://www.google.com/device",
+        "interval": interval,
+        "expires_in": int(payload.get("expires_in") or 900),
+    })
+
+
+@app.route("/api/youtube/oauth/poll", methods=["POST"])
+def api_youtube_oauth_poll():
+    global ytmusic, _auth_state_ok
+    data = request.get_json(silent=True) or {}
+    flow_id = str(data.get("flow_id") or "").strip()
+    with _youtube_oauth_lock:
+        flow = _youtube_oauth_pending.get(flow_id)
+        if not flow:
+            return jsonify({"error": "This sign-in request is no longer active"}), 404
+        now = time.time()
+        if flow["expires_at"] <= now:
+            _youtube_oauth_pending.pop(flow_id, None)
+            return jsonify({"error": "The YouTube sign-in code expired"}), 410
+        if flow["next_poll"] > now:
+            return jsonify({"pending": True, "retry_after": max(1, int(flow["next_poll"] - now + 0.5))})
+        flow["next_poll"] = now + flow["interval"]
+        request_data = dict(flow)
+
+    try:
+        response = requests.post(
+            _YOUTUBE_TOKEN_URL,
+            data={
+                "client_id": request_data["client_id"],
+                "client_secret": request_data["client_secret"],
+                "device_code": request_data["device_code"],
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            },
+            timeout=12,
+        )
+        payload = response.json()
+    except Exception as error:
+        return jsonify({"error": f"Could not check YouTube sign-in: {error}"}), 502
+
+    if not response.ok:
+        reason = payload.get("error", "authorization_pending")
+        if reason == "authorization_pending":
+            return jsonify({"pending": True, "retry_after": request_data["interval"]})
+        if reason == "slow_down":
+            with _youtube_oauth_lock:
+                if flow_id in _youtube_oauth_pending:
+                    _youtube_oauth_pending[flow_id]["interval"] += 5
+            return jsonify({"pending": True, "retry_after": request_data["interval"] + 5})
+        with _youtube_oauth_lock:
+            _youtube_oauth_pending.pop(flow_id, None)
+        status = 403 if reason == "access_denied" else 410 if reason == "expired_token" else 502
+        return jsonify({"error": payload.get("error_description") or reason.replace("_", " ").title()}), status
+
+    if not payload.get("access_token") or not payload.get("refresh_token"):
+        return jsonify({"error": "YouTube returned an incomplete authorization token"}), 502
+    token = {
+        "access_token": payload["access_token"],
+        "refresh_token": payload["refresh_token"],
+        "expires_in": int(payload.get("expires_in") or 3600),
+        "expires_at": int(time.time()) + int(payload.get("expires_in") or 3600),
+        "scope": payload.get("scope") or _YOUTUBE_OAUTH_SCOPE,
+        "token_type": payload.get("token_type") or "Bearer",
+    }
+    _atomic_write_json(_yt_oauth_file, token)
+    with _youtube_oauth_lock:
+        _youtube_oauth_pending.pop(flow_id, None)
+    _auth_state_ok = True
+    ytmusic = _init_ytmusic()
+    with _liked_lock:
+        _liked_cache.clear()
+    _invalidate_stream_cache()
+    return jsonify({"authenticated": True, "message": "YouTube Music connected"})
+
+
 @app.route("/api/youtube/auth_status")
 def api_youtube_auth_status():
     """Return current YouTube auth state for the Python backend."""
     has_cookies = bool(_resolve_cookie_file())
     has_headers = has_valid_auth_state()
+    oauth_credentials = bool(_load_youtube_oauth_credentials())
+    oauth_token = _has_youtube_oauth_state()
+
+    # Check if headers.json is potentially expired (SAPISIDHASH expires ~2 hours)
+    headers_age = 0
+    if _yt_headers_file.exists():
+        try:
+            headers_age = time.time() - _yt_headers_file.stat().st_mtime
+        except Exception:
+            pass
+    headers_potentially_expired = headers_age > 7200  # 2 hours
+
     return jsonify({
+        "authenticated": has_headers and not headers_potentially_expired,
         "cookies": has_cookies,
         "ytmusic_auth": has_headers,
-        "ytmusic_authenticated": has_headers
+        "ytmusic_authenticated": has_headers,
+        "oauth_configured": oauth_credentials,
+        "oauth_token": oauth_token,
+        "android": IS_ANDROID,
+        "headers_age_seconds": int(headers_age),
+        "headers_potentially_expired": headers_potentially_expired,
     })
+
+
+def _fetch_youtube_likes_raw(limit: int, timeout: int = 18) -> dict:
+    """Fetch the account library with a hard route-level deadline."""
+    future = _io_executor.submit(ytmusic.get_liked_songs, limit=limit)
+    try:
+        result = future.result(timeout=timeout)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError("YouTube Music liked songs timed out") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("YouTube Music returned an invalid liked-songs response")
+    return result
+
+
+# Matches upstream ytmusicapi/HTTP messages that indicate the embedded
+# SAPISIDHASH or session cookies expired. Used to trigger one bounded
+# rebuild+retry instead of misreporting a logged-in session as "unauthenticated".
+_YTMUSIC_AUTH_FAIL_RE = re.compile(r"401|unauthorized|unauthenticated", re.I)
+_ytmusic_auth_rebuild_lock = threading.Lock()
+_ytmusic_auth_rebuild_last = 0.0
+_YTMUSIC_AUTH_REBUILD_COOLDOWN = 60.0
+
+
+def _maybe_rebuild_ytmusic_auth() -> bool:
+    """Cooldown-bounded, single-flight auth rebuild. Regenerating headers.json
+    refreshes the embedded SAPISIDHASH timestamp, which covers the long-session
+    case where an otherwise-valid login slowly stops authenticating."""
+    global _ytmusic_auth_rebuild_last
+    with _ytmusic_auth_rebuild_lock:
+        now = time.time()
+        if now - _ytmusic_auth_rebuild_last < _YTMUSIC_AUTH_REBUILD_COOLDOWN:
+            return False
+        _ytmusic_auth_rebuild_last = now
+    try:
+        return bool(_rebuild_ytmusic_auth())
+    except Exception as exc:
+        log.warning(f"Implicit YouTube auth rebuild failed: {exc}")
+        return False
+
 
 @app.route("/api/youtube/liked_songs")
 def api_youtube_liked_songs():
     """Fetch the user's liked songs from YouTube Music (requires auth)."""
     if not has_valid_auth_state():
-        return jsonify({"error": "Not authenticated", "tracks": []}), 401
+        # cookies.txt can appear after startup (web login race, migration).
+        # Give the cached state one bounded rebuild from the cookie file before
+        # wrongly declaring the session unauthenticated.
+        if not (_resolve_cookie_file() and _maybe_rebuild_ytmusic_auth() and has_valid_auth_state()):
+            return jsonify({"error": "not_authenticated", "tracks": []}), 401
     try:
         limit = min(int(request.args.get("limit", 50)), 200)
         now = time.time()
@@ -3032,7 +5889,15 @@ def api_youtube_liked_songs():
             entry = _liked_cache.get(limit)
             if entry and (now - entry[0]) < _LIKED_TTL:
                 return jsonify(entry[1])
-        result = ytmusic.get_liked_songs(limit=limit)
+        try:
+            result = _fetch_youtube_likes_raw(limit)
+        except Exception as first_err:
+            # Auth-flavoured failures can come from a stale SAPISIDHASH on a
+            # genuinely-logged-in session (playback keeps working because
+            # streaming doesn't need SAPISIDHASH). Rebuild once and retry.
+            if not (_YTMUSIC_AUTH_FAIL_RE.search(str(first_err)) and _maybe_rebuild_ytmusic_auth()):
+                raise
+            result = _fetch_youtube_likes_raw(limit)
         tracks = []
         for t in result.get("tracks", []):
             if not t or t.get("videoId") is None:
@@ -3054,8 +5919,11 @@ def api_youtube_liked_songs():
             _liked_cache[limit] = (now, payload)
         return jsonify(payload)
     except Exception as e:
-        log.warning(f"YouTube liked songs fetch failed: {e}")
-        return jsonify({"error": str(e), "tracks": []}), 500
+        msg = str(e)
+        log.warning(f"YouTube liked songs fetch failed: {msg}")
+        if _YTMUSIC_AUTH_FAIL_RE.search(msg):
+            return jsonify({"error": "not_authenticated", "tracks": []}), 401
+        return jsonify({"error": msg, "transient": True, "tracks": []}), 500
 
 @app.route("/api/playlists/delete", methods=["POST"])
 def api_playlists_delete():
@@ -3064,11 +5932,13 @@ def api_playlists_delete():
     safe_name = _safe_playlist_name(name)
     if not safe_name or not _validate_playlist_path(safe_name):
         return jsonify({"error": "Invalid playlist name"}), 400
-    target = PLAYLISTS_DIR / safe_name
-    if not target.exists():
-        return jsonify({"error": "Playlist not found"}), 404
     try:
-        shutil.rmtree(target)
+        with _playlist_catalog_lock:
+            with _playlist_guard(safe_name):
+                target = PLAYLISTS_DIR / safe_name
+                if not target.exists():
+                    return jsonify({"error": "Playlist not found"}), 404
+                shutil.rmtree(target)
         _invalidate_playlist_cache()
         _invalidate_file_index()
         return jsonify({"success": True})
@@ -3169,6 +6039,13 @@ def standardize_track(track):
                 track["album_art"] = _upscale_thumb(current_art)
             else:
                 track["album_art"] = current_art
+        candidates = track.get("art_candidates") if isinstance(track.get("art_candidates"), list) else []
+        track["art_candidates"] = list(dict.fromkeys(
+            [current_art] + [str(url) for url in candidates if url] +
+            ([f"https://i.ytimg.com/vi/{track['videoId']}/maxresdefault.jpg"] if track.get("videoId") else [])
+            + ([f"https://i.ytimg.com/vi/{track['videoId']}/hqdefault.jpg"] if track.get("videoId") else [])
+        ))[:6]
+        track.setdefault("art_source", _art_source_hint(current_art))
     
     # Standardize Duration
     if not track.get("dur"):
@@ -3180,150 +6057,57 @@ def standardize_track(track):
         
     return track
 
-def fetch_single_itunes_cover(track):
-    """
-    Exclusive resolver for high-res artwork and standardized metadata.
-    """
-    track = dict(track)
-    track = standardize_track(track)
-    
-    # Skip iTunes for artist results
-    if track.get("type") == "artist" or track.get("resultType") == "artist":
-        return track
+def resolve_artwork_batch(tracks: list[dict], force: bool = False) -> list[dict]:
+    """Resolve artwork, recovering sparse metadata through recording matching."""
+    normalized = [standardize_track(dict(track)) for track in tracks or [] if isinstance(track, dict)]
+    fetcher = _ensure_artwork_fetcher()
+    resolved = fetcher.fetch_artwork_batch(normalized, force=force)
 
-    # Skip iTunes API for already-enhanced results (iTunes search already provided metadata)
-    if track.get("enhanced"):
-        if not track.get("duration"):
-            yt_duration = track.get('dur') if track.get('dur') is not None else (track.get('duration') or track.get('length'))
-            if isinstance(yt_duration, int):
-                minutes = yt_duration // 60
-                seconds = yt_duration % 60
-                track['duration'] = f"{minutes}:{seconds:02d}"
-            else:
-                track['duration'] = yt_duration or "3:30"
-        return track
-        
-    title = track["title"]
-    artist_name = track["artist_name"]
-    
-    # Clean up title query string
-    clean_title = title.split('(')[0].split('-')[0].split('[')[0].strip()
-    query_key = f"{artist_name.lower().strip()}|{clean_title.lower().strip()}"
-    
-    # Check cache first
-    with _itunes_art_lock:
-        cached = _itunes_art_cache.get(query_key)
-        if cached:
-            _itunes_art_cache.move_to_end(query_key)
-    if cached:
-        track['album_art'] = cached.get('album_art', track.get('album_art', ''))
-        track['art'] = cached.get('art', track.get('art', ''))
-        if cached.get('artist_name'):
-            track['artist_name'] = cached['artist_name']
-            track['artist'] = cached['artist_name']
-        if cached.get('dur'):
-            track['dur'] = cached['dur']
-        if cached.get('duration'):
-            track['duration'] = cached['duration']
-        track['enhanced'] = True
-        return track
+    missing = [index for index, track in enumerate(resolved)
+               if not (track.get("art") or track.get("album_art") or track.get("art_candidates"))]
+    if not missing:
+        return resolved
 
-    duration_string = None
-    
-    # Build a list of candidate query terms — start with the cleaned title, fall back to the original
-    # full title if the cleaned version returns no results (e.g. tracks with "(feat. X)" or "- Live").
-    candidate_titles = [clean_title]
-    if title != clean_title:
-        candidate_titles.append(title)
-    # Also try just the raw title with no parentheses/brackets but keeping hyphens (for "A - B" style names)
-    paren_stripped = title.split('(')[0].split('[')[0].strip()
-    if paren_stripped and paren_stripped not in candidate_titles:
-        candidate_titles.append(paren_stripped)
+    def recover_context(index):
+        track = normalized[index]
+        recording = resolve_recording(
+            track.get("name") or track.get("title") or "",
+            track.get("artist") or track.get("artist_name") or "",
+            track.get("dur") or track.get("duration"),
+            track.get("album") or track.get("albumName") or "",
+            track.get("albumId") or "",
+        )
+        if not recording:
+            return index, None
+        enriched = dict(track)
+        enriched["videoId"] = recording.get("videoId") or enriched.get("videoId", "")
+        enriched["album"] = enriched.get("album") or recording.get("album", "")
+        enriched["albumId"] = enriched.get("albumId") or recording.get("albumId", "")
+        enriched["dur"] = enriched.get("dur") or recording.get("duration") or 0
+        if recording.get("art"):
+            enriched["art"] = recording["art"]
+            enriched["album_art"] = recording["art"]
+            enriched["art_candidates"] = [recording["art"]]
+            enriched["art_source"] = "youtube"
+        enriched["recording_confidence"] = (
+            recording.get("confidence") or (recording.get("_match") or {}).get("score") or 0
+        )
+        return index, standardize_track(enriched)
 
-    found_result = False
-    for attempt in range(3):
-        got_429 = False
-        for q_title in candidate_titles:
-            try:
-                if not _itunes_semaphore.acquire(timeout=10):
-                    continue
-                try:
-                    url = "https://itunes.apple.com/search"
-                    params = {"term": f"{artist_name} {q_title}", "entity": "song", "limit": 5}
-                    response = _itunes_session.get(url, params=params, timeout=5)
-                    
-                    if response.status_code == 429:
-                        retry_after = int(response.headers.get("Retry-After", 5))
-                        time.sleep(min(retry_after, 8))
-                        got_429 = True
-                        break  # restart candidate loop after backoff
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        results = data.get('results', [])
-                        if results:
-                            result = results[0]
-                            
-                            # Extract high-res artwork
-                            low_res_url = result.get('artworkUrl100', '')
-                            if low_res_url:
-                                high_res_url = low_res_url.replace('/100x100bb.jpg', '/600x600bb.jpg')
-                                track['album_art'] = high_res_url
-                                track['art'] = high_res_url
-                            
-                            if result.get('artistName'):
-                                track['artist_name'] = result['artistName']
-                                track['artist'] = result['artistName']
-                            
-                            millis = result.get('trackTimeMillis')
-                            if millis:
-                                total_seconds = int(millis / 1000)
-                                minutes = total_seconds // 60
-                                seconds = total_seconds % 60
-                                duration_string = f"{minutes}:{seconds:02d}"
-                                track['dur'] = total_seconds
-                            
-                            track['enhanced'] = True
-                            found_result = True
-                            
-                            # Cache the result
-                            with _itunes_art_lock:
-                                _itunes_art_cache[query_key] = {
-                                    'album_art': track.get('album_art', ''),
-                                    'art': track.get('art', ''),
-                                    'artist_name': track.get('artist_name', ''),
-                                    'dur': track.get('dur'),
-                                    'duration': duration_string,
-                                }
-                                if len(_itunes_art_cache) > _ITUNES_ART_CACHE_MAX:
-                                    _itunes_art_cache.popitem(last=False)
-                            break  # success — stop trying candidates
-                        # No results for this candidate — try the next one (if any)
-                        continue
-                    else:
-                        break  # non-200, non-429 — don't retry
-                finally:
-                    _itunes_semaphore.release()
-            except Exception as e:
-                log.debug(f"iTunes lookup failed for {title}: {e}")
-                break
-        if found_result or not got_429:
-            break  # done (success or exhausted candidates without 429)
-            
-    # --- Fallback: Extract YouTube Music native duration if iTunes parsing failed ---
-    if not duration_string:
-        yt_duration = track.get('dur') or track.get('duration') or track.get('length')
-        if isinstance(yt_duration, int):
-            minutes = yt_duration // 60
-            seconds = yt_duration % 60
-            duration_string = f"{minutes}:{seconds:02d}"
-        elif isinstance(yt_duration, str) and ":" in yt_duration:
-            duration_string = yt_duration
-        else:
-            duration_string = "3:30"
-
-    track['duration'] = duration_string
-    return track
+    futures = [_resolution_executor.submit(recover_context, index) for index in missing]
+    recovered = []
+    for future in as_completed(futures):
+        try:
+            index, track = future.result()
+            if track:
+                recovered.append((index, track))
+        except Exception as exc:
+            log.debug("Artwork recording-context recovery failed: %s", exc)
+    if recovered:
+        second_pass = fetcher.fetch_artwork_batch([track for _index, track in recovered], force=True)
+        for (index, _track), result in zip(recovered, second_pass):
+            resolved[index] = result
+    return resolved
 
 @app.route("/api/search")
 def api_search():
@@ -3331,9 +6115,8 @@ def api_search():
     filter_type = request.args.get("filter", "all")
     _burst_check("search", f"{filter_type}:{q[:40]}")
 
-    # Dispatch by filter. Cover enhancer only handles track-shape; album / artist
-    # shapes have browseId / album fields instead of title / artist_name, and
-    # would KeyError inside fetch_single_itunes_cover's iTunes lookup.
+    # Dispatch by filter. Artwork matching only applies to track-shaped results;
+    # album and artist shapes keep their native provider images.
     if filter_type == "all":
         # Itunes search already returns high-res artwork; standardize so the
         # frontend gets uniform schema keys (name, artist, tid, dur, etc.)
@@ -3349,8 +6132,8 @@ def api_search():
 
     if filter_type == "track":
         # Track path: yt-music returns schemaless dicts → standardize →
-        # parallel iTunes cover enhancement for high-res artwork.
-        processed_results = list(_io_executor.map(fetch_single_itunes_cover, results))
+        # one shared ranked artwork pass with bounded provider concurrency.
+        processed_results = resolve_artwork_batch(results)
         return jsonify(processed_results)
 
     # Album / Artist path: bypass the cover enhancer (shape mismatch).
@@ -3386,7 +6169,7 @@ def api_radio_suggest():
 
 
 def _radio_suggest_tracks(vid):
-    """Resolve radio suggestion tracks for a seed vid (watch playlist + iTunes art),
+    """Resolve radio suggestion tracks for a seed vid (watch playlist + ranked art),
     cached per vid with TTL so repeated seeds don't re-hit YouTube Music / Apple."""
     now = time.time()
     with _radio_suggest_lock:
@@ -3434,8 +6217,8 @@ def _radio_suggest_tracks(vid):
         raw_list.append(_build_track_dict(name, artist, art, dur, tid, v_id,
             (e.get("album") or {}).get("id") or "", title=name, artist_name=artist))
 
-    # 3. Parallel iTunes Artwork Resolution
-    sanitized_tracks = list(_io_executor.map(fetch_single_itunes_cover, raw_list))
+    # 3. Shared ranked artwork resolution (deduplicated and concurrency-bounded)
+    sanitized_tracks = resolve_artwork_batch(raw_list)
 
     with _radio_suggest_lock:
         _radio_suggest_cache[vid] = (now, sanitized_tracks)
@@ -3452,31 +6235,28 @@ def api_lyrics():
     dur_str = request.args.get("duration")
     _burst_check("lyrics", f"{title[:30]} | {artist[:20]}")
     force = request.args.get("force", "").lower() in ("1", "true", "yes")
-    
-    duration = None
-    if dur_str and dur_str != "undefined":
-        try: duration = int(float(dur_str))
-        except (ValueError, TypeError):
-            log.debug(f"Could not parse duration string: {dur_str}")
-
+    duration = _coerce_duration_seconds(dur_str)
     tid = get_track_id(title, artist)
+    identity = _lyrics_identity_signature(title, artist, duration)
+    target = {"title": title, "artist": artist, "album": album, "duration": duration}
 
-    # 0. Check cache first (memory → disk) — unless force=1 bypass is requested.
+    # Cache v2 binds the entry to normalized identity + version tags + duration.
+    # Older positive entries are deliberately re-evaluated instead of living forever.
     if not force:
-        cached = _read_lyrics_cache(tid)
+        cached = _read_lyrics_cache(tid, identity)
         if cached:
-            out = {k: v for k, v in cached.items() if k != "exp"}
+            out = {k: v for k, v in cached.items() if k not in {"exp", "cacheVersion", "identity"}}
             return jsonify(out)
 
     def is_non_ascii(s):
         return any(ord(c) > 127 for c in s)
 
     def clean_query(q):
-        # L5: full normalisation — NFKC, parenthesised & bare feat./remaster tags,
-        # `&`/`and` fold, internal whitespace collapse, `- Topic` suffix.
+        # Provider queries drop presentation noise and feature credits but KEEP
+        # material version markers. Removing "live" or "remix" here was a major
+        # source of valid-title/wrong-recording matches.
         q = unicodedata.normalize("NFKC", q)
         q = q.replace(" & ", " and ")
-        # Parenthesised (feat./ft./featuring/vs./with/official/lyric/video/...)
         q = re.sub(r'[\(\[][Ff](?:eat|t)\.?.*?[\)\]]', '', q)
         q = re.sub(r'[\(\[][Ff]eaturing\s+.*?[\)\]]', '', q, flags=re.IGNORECASE)
         q = re.sub(r'[\(\[][Vv]s\..*?[\)\]]', '', q)
@@ -3484,10 +6264,8 @@ def api_lyrics():
         q = re.sub(r'[\(\[][Oo]fficial.*?[\)\]]', '', q)
         q = re.sub(r'[\(\[][Ll]yric.*?[\)\]]', '', q)
         q = re.sub(r'[\(\[][Vv]ideo.*?[\)\]]', '', q)
-        # Bare (no parens) feat./ft./featuring — match up to end or next ` - ` separator
         q = re.sub(r'\s+[Ff](?:eat|t)\.?\s+.*?(?=\s+-\s|$)', '', q)
         q = re.sub(r'\s+[Ff]eaturing\s+.*?(?=\s+-\s|$)', '', q, flags=re.IGNORECASE)
-        q = re.sub(r'-?\s*(Remaster(?:ed)?\s*\d{0,4}|Deluxe|Expanded|Bonus|Live|Acoustic|Cover|Version)', '', q, flags=re.IGNORECASE)
         q = q.replace(" - トピック", "").replace(" - Topic", "")
         q = re.sub(r'\s+', ' ', q)
         return q.strip()
@@ -3506,20 +6284,35 @@ def api_lyrics():
         except Exception as e:
             log.debug(f"Artist normalization search failed: {e}")
 
-    full_query = f"{search_artist} {search_title}"
+    full_query = f"{search_artist} {search_title}".strip()
     result = {"synced": False, "lines": []}
 
-    # ── Helper: parse LRCLIB response into result dict ──
-    def _parse_lrclib_response(data):
+    def _parse_lrclib_response(data, strict=False):
+        if not isinstance(data, dict) or data.get("instrumental"):
+            return None
+        candidate_identity = {
+            "title": data.get("trackName") or (title if strict else ""),
+            "artist": data.get("artistName") or (artist if strict else ""),
+            "album": data.get("albumName") or "",
+            "duration": data.get("duration"),
+        }
+        match = _score_track_candidate(target, candidate_identity)
         if data.get("syncedLyrics"):
             parsed = _parse_lrc(data["syncedLyrics"])
             if parsed:
-                return {"synced": True, "lines": parsed, "_source": "lrclib", "_duration": data.get("duration")}
+                return {
+                    "synced": True, "lines": parsed, "_source": "lrclib",
+                    "_match": match, "_duration": data.get("duration"),
+                    "_matchedTitle": candidate_identity["title"], "_matchedArtist": candidate_identity["artist"],
+                }
         if data.get("plainLyrics"):
-            return {"synced": False, "lines": [{"time": 0.0, "text": data["plainLyrics"]}], "_source": "lrclib", "_duration": data.get("duration")}
+            return {
+                "synced": False, "lines": [{"time": 0.0, "text": data["plainLyrics"]}],
+                "_source": "lrclib", "_match": match, "_duration": data.get("duration"),
+                "_matchedTitle": candidate_identity["title"], "_matchedArtist": candidate_identity["artist"],
+            }
         return None
 
-    # ── Tier 1: Race LRCLIB strict + syncedlyrics (expanded provider list) in parallel ──
     lrclib_url = "https://lrclib.net/api/get"
     lrclib_params = {"track_name": search_title, "artist_name": search_artist}
     if album:
@@ -3531,116 +6324,100 @@ def api_lyrics():
         try:
             r = _lrclib_session.get(lrclib_url, params=lrclib_params, timeout=4)
             if r.ok:
-                return _parse_lrclib_response(r.json())
+                return _parse_lrclib_response(r.json(), strict=True)
         except Exception as e:
             log.debug(f"LRCLIB strict lookup failed: {e}")
         return None
 
     def _fetch_syncedlyrics():
-        # L1: Expanded provider list. NetEase/Megalobiz retain Asian-market primacy;
-        #     Western providers cover the long tail. The two batches are tried sequentially
-        #     so a slow NetEase response can't starve Western providers of budget — the
-        #     outer threadfuture's timeout (8s, raised in the join below) caps total wall time.
+        # syncedlyrics returns no candidate metadata. It remains a useful long-tail
+        # source, but receives a deliberately lower identity confidence and cannot
+        # override a metadata-validated LRCLIB match.
+        version_sensitive = bool(_track_version_profile(title)["tags"])
+        proxy_score = 56 if version_sensitive else 72
+        proxy_match = {"score": proxy_score, "acceptable": not version_sensitive}
         try:
             import syncedlyrics
-            # NetEase/Megalobiz first — Asian-market primacy preserved.
-            try:
-                lrc = syncedlyrics.search(full_query, providers=["NetEase", "Megalobiz"])
-                if lrc and "[" in lrc and ":" in lrc:
-                    parsed = _parse_lrc(lrc)
-                    if parsed:
-                        return {"synced": True, "lines": parsed, "_source": "syncedlyrics_em"}
-                if lrc and lrc.strip():
-                    return {"synced": False, "lines": [{"time": 0.0, "text": lrc.strip()}], "_source": "syncedlyrics_em"}
-            except Exception as e:
-                log.debug(f"syncedlyrics (EM) search failed: {e}")
-            # Western-market fallback: Musixmatch, Deezer, Genius, Lyricsify, LRCLIB.
-            try:
-                lrc = syncedlyrics.search(full_query, providers=["Musixmatch", "Deezer", "Genius", "Lyricsify", "LRCLIB"])
-                if lrc and "[" in lrc and ":" in lrc:
-                    parsed = _parse_lrc(lrc)
-                    if parsed:
-                        return {"synced": True, "lines": parsed, "_source": "syncedlyrics_western"}
-                if lrc and lrc.strip():
-                    return {"synced": False, "lines": [{"time": 0.0, "text": lrc.strip()}], "_source": "syncedlyrics_western"}
-            except Exception as e:
-                log.debug(f"syncedlyrics (Western) search failed: {e}")
+            provider_groups = (
+                ("syncedlyrics_em", ["NetEase", "Megalobiz"]),
+                ("syncedlyrics_western", ["Musixmatch", "Deezer", "Genius", "Lyricsify", "LRCLIB"]),
+            )
+            for source, providers in provider_groups:
+                try:
+                    lrc = syncedlyrics.search(full_query, providers=providers)
+                    if lrc and "[" in lrc and ":" in lrc:
+                        parsed = _parse_lrc(lrc)
+                        if parsed:
+                            return {"synced": True, "lines": parsed, "_source": source, "_match": proxy_match}
+                    if lrc and lrc.strip():
+                        return {"synced": False, "lines": [{"time": 0.0, "text": lrc.strip()}], "_source": source, "_match": proxy_match}
+                except Exception as e:
+                    log.debug(f"{source} search failed: {e}")
         except Exception as e:
             log.debug(f"syncedlyrics import failed: {e}")
         return None
 
-    # L3: Collect BOTH Tier-1 candidates before deciding — no early-exit on race-winner.
-    #     Mislabelled syncedlyrics results can no longer beat a duration-matched LRCLIB synced lyric.
-    t1_futures = [_io_executor.submit(_fetch_lrclib_strict), _io_executor.submit(_fetch_syncedlyrics)]
-    t1_candidates = []
-    for f in t1_futures:
-        try:
+    t1_futures = [_io_executor.submit(_fetch_lrclib_strict)]
+    if SYNCEDLYRICS_ENABLED:
+        t1_futures.append(_io_executor.submit(_fetch_syncedlyrics))
+    candidates = []
+    try:
+        for f in as_completed(t1_futures, timeout=8):
             res = f.result(timeout=8)
             if res:
-                t1_candidates.append(res)
-        except Exception:
-            pass
+                candidates.append(res)
+    except Exception:
+        # Provider work is best-effort; LRCLIB fuzzy search below remains available.
+        pass
 
-    def _dur_score(cand):
-        """L3: how far the candidate's duration is from the target (0 best). 5 = unknown."""
-        cd = cand.get("_duration")
-        if not duration or not isinstance(cd, (int, float)):
-            return 5
-        return abs(cd - duration)
-
-    def _rank(cands):
-        """L3: prefer synced > plain; within each, prefer closest-duration match."""
-        if not cands:
-            return None
-        synced = [c for c in cands if c.get("synced")]
-        plain = [c for c in cands if not c.get("synced")]
-        if synced:
-            # Smallest duration delta wins; ties broken by source preference (lrclib is strictest).
-            return sorted(synced, key=lambda c: (_dur_score(c), 0 if c.get("_source") == "lrclib" else 1))[0]
-        if plain:
-            return sorted(plain, key=lambda c: (_dur_score(c), 0 if c.get("_source") == "lrclib" else 1))[0]
-        return None
-
-    best = _rank(t1_candidates)
-    if best:
-        out = {"synced": best["synced"], "lines": best["lines"]}
-        _write_lyrics_cache(tid, out)
-        return jsonify(out)
-
-    # ── Tier 2: LRCLIB search fallback (fuzzy, validate duration) ──
-    t2_candidates = []
+    # Metadata-bearing fuzzy candidates are scored before any source is chosen.
     try:
-        r = _lrclib_session.get("https://lrclib.net/api/search", params={"q": full_query}, timeout=4)
+        r = _lrclib_session.get(
+            "https://lrclib.net/api/search",
+            params={"track_name": search_title, "artist_name": search_artist},
+            timeout=4,
+        )
         if r.ok:
-            t2_candidates = r.json() or []
+            for item in (r.json() or [])[:20]:
+                parsed = _parse_lrclib_response(item)
+                if parsed:
+                    candidates.append(parsed)
+    except TimeoutError as e:
+        log.warning(f"YouTube liked songs fetch timed out: {e}")
+        return jsonify({"error": str(e), "tracks": []}), 504
     except Exception as e:
         log.debug(f"LRCLIB search fallback failed: {e}")
 
-    if t2_candidates:
-        if duration:
-            exact = [c for c in t2_candidates if isinstance(c.get("duration"), (int, float)) and abs(c["duration"] - duration) <= 5]
-            if exact:
-                t2_candidates = exact
-        # Synced first.
-        for item in t2_candidates:
-            if item.get("syncedLyrics"):
-                parsed = _parse_lrc(item["syncedLyrics"])
-                if parsed:
-                    out = {"synced": True, "lines": parsed}
-                    _write_lyrics_cache(tid, out)
-                    return jsonify(out)
-        # Plain next.
-        for item in t2_candidates:
-            if item.get("plainLyrics"):
-                out = {"synced": False, "lines": [{"time": 0.0, "text": item["plainLyrics"]}]}
-                _write_lyrics_cache(tid, out)
-                return jsonify(out)
+    best = _select_lyrics_candidate(candidates, duration)
+    if best:
+        out = {
+            "synced": bool(best["synced"]), "lines": best["lines"],
+            "source": best.get("_source", "unknown"),
+            "confidence": best.get("_selectionScore", 0),
+            "matchedTitle": best.get("_matchedTitle", ""),
+            "matchedArtist": best.get("_matchedArtist", ""),
+        }
+        _write_lyrics_cache(tid, out, identity=identity)
+        return jsonify(out)
 
-    # ── Tier 3: YTMusic plain lyrics (final resort) ──
+    # YTMusic lyrics are tied to a video id. Preserve the selected video's exact
+    # version; when absent, choose a scored candidate instead of result[0].
     if not vid:
         try:
-            yt_res = ytmusic.search(full_query, filter="songs", limit=1)
-            if yt_res: vid = yt_res[0].get("videoId")
+            yt_results = ytmusic.search(full_query, filter="songs", limit=10)
+            yt_candidates = []
+            for item in yt_results or []:
+                artists = item.get("artists") or []
+                yt_candidates.append({
+                    "title": item.get("title", ""),
+                    "artist": artists[0].get("name", "") if artists else "",
+                    "album": (item.get("album") or {}).get("name", ""),
+                    "duration": item.get("duration_seconds") or item.get("duration"),
+                    "videoId": item.get("videoId", ""),
+                })
+            ranked_yt = _rank_track_candidates(target, yt_candidates, minimum=68)
+            if ranked_yt:
+                vid = ranked_yt[0].get("videoId")
         except Exception as e:
             log.debug(f"YTMusic search for lyrics failed: {e}")
     if vid:
@@ -3650,15 +6427,21 @@ def api_lyrics():
             if lyrics_id:
                 lyrics_data = ytmusic.get_lyrics(lyrics_id)
                 if lyrics_data.get("lyrics"):
-                    out = {"synced": False, "lines": [{"time": 0.0, "text": lyrics_data["lyrics"]}]}
-                    _write_lyrics_cache(tid, out)
-                    return jsonify(out)
+                    yt_candidate = {
+                        "synced": False,
+                        "lines": [{"time": 0.0, "text": lyrics_data["lyrics"]}],
+                        "_source": "ytmusic",
+                        "_match": {"score": 90, "acceptable": True},
+                    }
+                    selected = _select_lyrics_candidate([yt_candidate], duration)
+                    if selected:
+                        out = {"synced": False, "lines": selected["lines"], "source": "ytmusic", "confidence": selected["_selectionScore"]}
+                        _write_lyrics_cache(tid, out, identity=identity)
+                        return jsonify(out)
         except Exception as e:
             log.debug(f"YTMusic lyrics fetch failed: {e}")
 
-    # Tier 4 fall-through: nothing found — negative-cache for 7 days so repeated plays of
-    # the same unlyricked track don't re-hit every provider each time. (L2)
-    _write_lyrics_cache(tid, result, neg_ttl=7 * 24 * 3600)
+    _write_lyrics_cache(tid, result, neg_ttl=7 * 24 * 3600, identity=identity)
     return jsonify(result)
 
 # Host whitelist for the word-lyric JSON proxy (see api_proxy_json below).
