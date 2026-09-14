@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0a0810">
+  <title>AkiMelody Mobile</title>
+  <link rel="stylesheet" href="/static/fontawesome/css/all.min.css">
+  <link rel="stylesheet" href="/static/css/mobile_player.css">
+</head>
+<body data-theme="dark">
+  <div class="aki-atmosphere" aria-hidden="true">
+    <div class="aki-cover-bg" id="mp-cover-bg"></div>
+    <div class="aki-cover-hero" id="mp-cover-hero"></div>
+    <div class="aki-color-field"></div>
+    <div class="aki-vignette"></div>
+    <div class="aki-grain"></div>
+  </div>
+
+  <div id="mp-a11y" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <main class="aki-shell" id="mp-shell">
+    <header class="aki-topbar">
+      <button class="brand-lockup" type="button" data-view-target="home" aria-label="AkiMelody home">
+        <span class="brand-mark"><i class="fa-solid fa-wave-square"></i></span>
+        <span><strong>AkiMelody</strong></span>
+      </button>
+      <div class="topbar-actions">
+        <span class="connection-pill" id="mp-connection" data-state="online"><i class="connection-dot"></i><span>Online</span></span>
+        <button class="round-button" type="button" data-view-target="settings" aria-label="Open settings"><i class="fa-solid fa-sliders"></i></button>
+      </div>
+    </header>
+
+    <div class="aki-views" id="mp-views">
+      <section class="aki-view" id="mp-view-home" data-view="home" aria-labelledby="mp-home-title">
+        <div class="page-heading"><div><span class="kicker">YOUR SPACE</span><h1 id="mp-home-title">Listen your way</h1><p>Everything you love, close at hand.</p></div></div>
+        <button class="continue-card" type="button" data-view-target="player">
+          <span class="continue-art"><img id="mp-home-art" alt="" decoding="async"><i class="fa-solid fa-music"></i></span>
+          <span class="continue-copy"><small>CONTINUE LISTENING</small><strong id="mp-home-track">Nothing playing</strong><span id="mp-home-artist">Find a track to begin</span></span>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+        <div class="section-title"><div><span class="kicker">QUICK ACCESS</span><h2>Your music</h2></div></div>
+        <div class="quick-grid">
+          <button type="button" class="quick-tile" data-library-mode="favorites"><i class="fa-solid fa-heart"></i><strong>Favorites</strong><span id="mp-home-favorites">0 saved</span></button>
+          <button type="button" class="quick-tile" data-library-mode="playlists"><i class="fa-solid fa-folder-open"></i><strong>Playlists</strong><span id="mp-home-playlists">0 collections</span></button>
+          <button type="button" class="quick-tile" data-library-mode="downloads"><i class="fa-solid fa-circle-down"></i><strong>Offline</strong><span id="mp-home-downloads">On this device</span></button>
+          <button type="button" class="quick-tile" data-sheet-open="queue"><i class="fa-solid fa-list-ul"></i><strong>Queue</strong><span id="mp-home-queue">0 tracks</span></button>
+          <button type="button" class="quick-tile" data-view-target="space" style="grid-column:1/-1;min-height:72px;flex-direction:row;align-items:center;justify-content:flex-start;gap:12px"><i class="fa-solid fa-wand-magic-sparkles" style="margin-bottom:0"></i><div style="text-align:left"><strong>Space</strong><span style="display:block">Community, Spotify, utilities</span></div><i class="fa-solid fa-chevron-right" style="margin-left:auto;font-size:12px;opacity:.6"></i></button>
+        </div>
+        <div class="section-title"><div><span class="kicker">RECENTLY SAVED</span><h2>Back in rotation</h2></div><button type="button" data-library-mode="favorites">See all</button></div>
+        <div class="horizontal-shelf" id="mp-home-shelf"></div>
+      </section>
+
+      <section class="aki-view active" id="mp-view-player" data-view="player" aria-labelledby="mp-player-title">
+        <div class="player-heading"><div><span class="kicker">NOW PLAYING</span><h1 id="mp-player-title">AkiMelody</h1></div><button class="round-button" type="button" data-sheet-open="queue" aria-label="Open queue"><i class="fa-solid fa-list-ul"></i><span class="count-badge" id="mp-queue-count">0</span></button></div>
+        <div class="player-stage">
+          <div class="album-orbit" id="mp-album-orbit" aria-hidden="true">
+            <img class="album-next-art" id="mp-art-incoming" alt="" decoding="async">
+          </div>
+          <div class="album-frame" id="mp-album-frame">
+            <img id="mp-art" alt="Current album artwork" decoding="async">
+            <div class="album-placeholder" id="mp-art-placeholder"><i class="fa-solid fa-music"></i><span>Select a track</span></div>
+            <span class="local-chip" id="mp-local-chip" hidden><i class="fa-solid fa-download"></i> On device</span>
+          </div>
+          <div class="gesture-heart" id="mp-gesture-heart" aria-hidden="true">
+            <span></span><i class="fa-solid fa-heart"></i>
+          </div>
+          <section class="album-lyrics" id="mp-album-lyrics" aria-label="Lyrics" hidden>
+            <header class="album-lyrics-header">
+              <div><span>LIVE LYRICS</span><strong id="mp-lyrics-subtitle">Nothing playing</strong></div>
+              <button type="button" id="mp-lyrics-close" aria-label="Close lyrics"><i class="fa-solid fa-xmark"></i></button>
+            </header>
+            <div class="album-lyrics-scroll" id="mp-lyrics-content" tabindex="0"></div>
+            <div class="album-lyrics-controls">
+              <button type="button" id="mp-lyrics-retry" aria-label="Retry lyrics" title="Retry lyrics"><i class="fa-solid fa-rotate-right"></i></button>
+              <label aria-label="Lyrics timing offset"><i class="fa-solid fa-clock"></i><input id="mp-lyrics-offset" type="range" min="-5" max="5" step=".25" value="0"><output id="mp-lyrics-offset-value">0.00s</output></label>
+            </div>
+          </section>
+        </div>
+        <div class="now-copy">
+          <div class="now-title-row"><div><h2 id="mp-title">Not playing</h2><button type="button" id="mp-artist" class="artist-link">AkiMelody</button></div><button class="round-button like-button" id="mp-like" type="button" aria-label="Like track" aria-pressed="false"><i class="fa-regular fa-heart"></i></button></div>
+          <div class="now-context"><button type="button" id="mp-album" class="context-link">Choose something from Search</button><span>•</span><span id="mp-source">Ready</span></div>
+        </div>
+        <div class="timeline-block">
+          <input id="mp-seek" type="range" min="0" max="1000" value="0" aria-label="Playback position">
+          <div><span id="mp-current-time">0:00</span><span id="mp-total-time">0:00</span></div>
+        </div>
+        <div class="transport">
+          <button type="button" id="mp-shuffle" aria-label="Shuffle" aria-pressed="false"><i class="fa-solid fa-shuffle"></i></button>
+          <button type="button" id="mp-prev" aria-label="Previous"><i class="fa-solid fa-backward-step"></i></button>
+          <button type="button" id="mp-play" class="play-button" aria-label="Play" aria-pressed="false"><i class="fa-solid fa-play"></i></button>
+          <button type="button" id="mp-next" aria-label="Next"><i class="fa-solid fa-forward-step"></i></button>
+          <button type="button" id="mp-repeat" aria-label="Repeat off" aria-pressed="false"><i class="fa-solid fa-repeat"></i></button>
+        </div>
+        <div class="player-tools">
+          <button type="button" id="mp-radio"><i class="fa-solid fa-tower-broadcast"></i><span>Radio</span></button>
+          <button type="button" id="mp-lyrics-toggle" aria-label="Show lyrics" aria-pressed="false"><i class="fa-solid fa-microphone-lines"></i><span>Lyrics</span></button>
+          <button type="button" data-sheet-open="playlist"><i class="fa-solid fa-folder-plus"></i><span>Playlist</span></button>
+        </div>
+      </section>
+
+      <section class="aki-view" id="mp-view-search" data-view="search" aria-labelledby="mp-search-title">
+        <div class="page-heading"><div><span class="kicker">DISCOVER</span><h1 id="mp-search-title">Find your sound</h1><p>Tracks, albums, and artists across your existing sources.</p></div></div>
+        <form class="search-panel" id="mp-search-form"><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i><input id="mp-search-input" type="search" placeholder="Song, artist, or album…" enterkeyhint="search" autocomplete="off" aria-label="Search music"><button class="search-submit" type="submit" aria-label="Search"><i class="fa-solid fa-arrow-right"></i></button></form>
+        <div class="search-filter-bar">
+          <input id="mp-search-filter" type="hidden" value="all">
+          <div class="search-filter-options" role="radiogroup" aria-label="Search type">
+            <button class="active" type="button" role="radio" aria-checked="true" data-search-filter="all">All</button>
+            <button type="button" role="radio" aria-checked="false" data-search-filter="track">Tracks</button>
+            <button type="button" role="radio" aria-checked="false" data-search-filter="album">Albums</button>
+            <button type="button" role="radio" aria-checked="false" data-search-filter="artist">Artists</button>
+          </div>
+          <button class="search-clear" type="button" id="mp-search-clear">Clear</button>
+        </div>
+        <div class="filter-row"><span id="mp-search-caption">Ready to discover</span></div>
+        <div class="content-list" id="mp-search-results"></div>
+      </section>
+
+      <section class="aki-view" id="mp-view-library" data-view="library" aria-labelledby="mp-library-title">
+        <div class="page-heading"><div><span class="kicker">YOUR MUSIC</span><h1 id="mp-library-title">Library</h1><p id="mp-library-subtitle">Saved locally and ready when you are.</p></div><div style="display:flex;gap:8px"><button class="round-button" type="button" data-view-target="space" aria-label="Open Space"><i class="fa-solid fa-wand-magic-sparkles"></i></button><button class="round-button" id="mp-create-playlist" type="button" aria-label="Create playlist"><i class="fa-solid fa-plus"></i></button></div></div>
+        <div class="library-dashboard" id="mp-library-content" aria-live="polite"></div>
+      </section>
+
+      <section class="aki-view" id="mp-view-detail" data-view="detail" aria-labelledby="mp-detail-title">
+        <div class="detail-hero"><button class="round-button back-button" type="button" id="mp-detail-back" aria-label="Back"><i class="fa-solid fa-arrow-left"></i></button><img id="mp-detail-art" alt="" decoding="async"><div><span class="kicker" id="mp-detail-type">COLLECTION</span><h1 id="mp-detail-title">Details</h1><p id="mp-detail-subtitle"></p></div></div>
+        <div class="detail-actions"><button type="button" id="mp-detail-play"><i class="fa-solid fa-play"></i> Play</button><button type="button" id="mp-detail-save"><i class="fa-solid fa-bookmark"></i> Save</button><button type="button" id="mp-detail-offline" hidden><i class="fa-solid fa-circle-down"></i><span>Offline play</span></button></div>
+        <div class="detail-bio" id="mp-detail-bio"></div>
+        <div class="content-list" id="mp-detail-content"></div>
+      </section>
+
+      <section class="aki-view" id="mp-view-space" data-view="space" aria-labelledby="mp-space-title">
+        <div class="page-heading"><div><span class="kicker">AKI SPACE</span><h1 id="mp-space-title">Make it yours</h1><p>Community discoveries, Spotify tools, and listening utilities.</p></div></div>
+        <div class="feature-grid">
+          <button type="button" data-space-action="community"><i class="fa-solid fa-people-group"></i><strong>Community</strong><span>Shared playlists and themes</span></button>
+          <button type="button" data-spotify-open="playlist"><i class="fa-brands fa-spotify"></i><strong>Spotify playlist</strong><span>Import with a shared link</span></button>
+          <button type="button" data-spotify-open="likes"><i class="fa-solid fa-heart"></i><strong>Spotify Likes</strong><span>Link your saved songs</span></button>
+          <button type="button" data-space-action="sleep"><i class="fa-solid fa-moon"></i><strong>Sleep timer</strong><span id="mp-sleep-label">Off</span></button>
+          <button type="button" data-view-target="settings"><i class="fa-solid fa-sliders"></i><strong>Settings</strong><span>Playback, account, and appearance</span></button>
+        </div>
+        <div class="settings-card"><span class="kicker">ALBUM COLOR</span><h2>Live palette</h2><p>The player extracts five color roles from the current cover and keeps text contrast readable.</p><div class="palette-preview"><i></i><i></i><i></i><i></i><i></i></div></div>
+      </section>
+
+      <section class="aki-view" id="mp-view-settings" data-view="settings" aria-labelledby="mp-settings-title">
+        <div class="page-heading"><div><span class="kicker">PREFERENCES</span><h1 id="mp-settings-title">Settings</h1><p>Playback, appearance, account, and local storage.</p></div></div>
+        <div class="settings-stack">
+          <label class="setting-row"><span><strong>Volume</strong><small>Player output level</small></span><input id="mp-volume" type="range" min="0" max="100" value="55"></label>
+          <label class="setting-row"><span><strong>Crossfade</strong><small>Smooth transitions between tracks</small></span><input id="mp-crossfade" type="checkbox" role="switch"></label>
+          <label class="setting-row"><span><strong>Dynamic album color</strong><small>Flow cover colors through the interface</small></span><input id="mp-dynamic-color" type="checkbox" role="switch" checked></label>
+          <label class="setting-row"><span><strong>Light appearance</strong><small>Use light surfaces while keeping album accents</small></span><input id="mp-theme" type="checkbox" role="switch"></label>
+          <label class="setting-row"><span><strong>Community showcase</strong><small>Show online community content</small></span><input id="mp-community" type="checkbox" role="switch" checked></label>
+          <button class="setting-row action-row" type="button" id="mp-auth"><span><strong>YouTube Music account</strong><small id="mp-auth-state">Check authentication status</small></span><i class="fa-solid fa-chevron-right"></i></button>
+          <button class="setting-row action-row danger" type="button" id="mp-clear-data"><span><strong>Clear cached user data</strong><small>Favorites, settings, queue, and cached downloads</small></span><i class="fa-solid fa-trash"></i></button>
+        </div>
+      </section>
+    </div>
+
+    <div class="mini-player" id="mp-mini-player" data-view-target="player" role="button" tabindex="0" aria-label="Open player" hidden>
+      <img id="mp-mini-art" alt="" decoding="async">
+      <div class="mini-copy"><strong id="mp-mini-title">Not playing</strong><span id="mp-mini-artist">AkiMelody</span></div>
+      <button type="button" id="mp-mini-play" class="mini-play" aria-label="Play"><i class="fa-solid fa-play"></i></button>
+    </div>
+    <nav class="aki-nav aki-nav--pill" aria-label="Primary navigation">
+      <button type="button" data-view-target="home" class="active"><i class="fa-solid fa-house"></i><span>Home</span></button>
+      <button type="button" data-view-target="search"><i class="fa-solid fa-magnifying-glass"></i><span>Search</span></button>
+      <button type="button" data-view-target="library"><i class="fa-solid fa-book-open"></i><span>Library</span></button>
+    </nav>
+    <button class="nav-reveal-handle" id="mp-nav-reveal" type="button" aria-label="Show navigation"><i class="fa-solid fa-chevron-up"></i></button>
+  </main>
+
+  <div class="aki-sheet" id="mp-sheet-queue" data-sheet="queue" hidden><button class="sheet-scrim" data-sheet-close aria-label="Close queue"></button><section class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="mp-queue-title"><header><div><span class="kicker">UP NEXT</span><h2 id="mp-queue-title">Queue</h2><p id="mp-queue-summary">0 tracks</p></div><button class="round-button" data-sheet-close aria-label="Close queue"><i class="fa-solid fa-xmark"></i></button></header><div class="sheet-toolbar"><button type="button" id="mp-save-queue"><i class="fa-solid fa-folder-plus"></i> Save as playlist</button><button type="button" id="mp-clear-queue"><i class="fa-solid fa-trash"></i> Clear</button></div><div class="sheet-scroll content-list" id="mp-queue-list"></div></section></div>
+  <div class="aki-sheet" id="mp-sheet-playlist" data-sheet="playlist" hidden><button class="sheet-scrim" data-sheet-close aria-label="Close playlist picker"></button><section class="sheet-panel compact-panel" role="dialog" aria-modal="true" aria-labelledby="mp-picker-title"><header><div><span class="kicker">SAVE TRACK</span><h2 id="mp-picker-title">Add to playlist</h2></div><button class="round-button" data-sheet-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button></header><form class="inline-form" id="mp-playlist-create-form"><input id="mp-playlist-name" maxlength="80" placeholder="New playlist name"><button type="submit">Create</button></form><div class="sheet-scroll content-list" id="mp-playlist-picker"></div></section></div>
+  <div class="aki-sheet" id="mp-sheet-spotify" data-sheet="spotify" hidden>
+    <button class="sheet-scrim" data-sheet-close aria-label="Close Spotify import"></button>
+    <section class="sheet-panel spotify-panel" role="dialog" aria-modal="true" aria-labelledby="mp-spotify-title">
+      <header><div><span class="kicker">SPOTIFY</span><h2 id="mp-spotify-title">Import a playlist</h2><p id="mp-spotify-subtitle">Bring a public Spotify playlist into AkiMelody.</p></div><button class="round-button" data-sheet-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button></header>
+      <div class="spotify-body">
+        <div class="spotify-mode-switch" role="tablist" aria-label="Spotify import type">
+          <button class="active" type="button" role="tab" aria-selected="true" data-spotify-mode="playlist"><i class="fa-solid fa-list-ul"></i> Playlist</button>
+          <button type="button" role="tab" aria-selected="false" data-spotify-mode="likes"><i class="fa-solid fa-heart"></i> Spotify Likes</button>
+        </div>
+        <div class="spotify-copy" id="mp-spotify-playlist-copy">
+          <p>Open a Spotify playlist, tap <strong>Share</strong>, copy its link, and paste it below.</p>
+        </div>
+        <div class="spotify-copy spotify-instructions" id="mp-spotify-likes-copy" hidden>
+          <p>Follow these steps to share your Spotify Liked Songs:</p>
+          <ol>
+            <li>Open &amp; Login to the Spotify App on your computer.</li>
+            <li>Click on your <strong>'Liked Songs'</strong> Playlist.</li>
+            <li>Press <strong>'Ctrl' + 'A'</strong> on your keyboard.</li>
+            <li>Right-Click any highlighted song and press add to playlist, then <strong>'New Playlist'</strong>.</li>
+            <li>Click on the Newly created playlist and then click on its name.</li>
+            <li>Rename it <strong>'Likes'</strong> and Save.</li>
+            <li>Then click Share and copy the link. Paste It Below!</li>
+          </ol>
+        </div>
+        <form class="spotify-form" id="mp-spotify-form">
+          <label for="mp-spotify-url">Spotify playlist link</label>
+          <div class="spotify-input-group">
+            <input id="mp-spotify-url" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://open.spotify.com/playlist/..." required>
+            <button type="button" id="mp-spotify-paste"><i class="fa-solid fa-clipboard"></i><span>Paste</span></button>
+          </div>
+          <div class="spotify-status" id="mp-spotify-status" role="status" aria-live="polite" hidden></div>
+          <button class="spotify-submit" id="mp-spotify-submit" type="submit" disabled><i class="fa-brands fa-spotify"></i><span>Import Playlist</span></button>
+        </form>
+      </div>
+    </section>
+  </div>
+  <div class="aki-sheet" id="mp-sheet-youtube" data-sheet="youtube" hidden>
+    <button class="sheet-scrim" data-sheet-close aria-label="Close YouTube connection"></button>
+    <section class="sheet-panel youtube-auth-panel" role="dialog" aria-modal="true" aria-labelledby="mp-youtube-title">
+      <header><div><span class="kicker">YOUTUBE MUSIC</span><h2 id="mp-youtube-title">Connect on this phone</h2><p>No desktop or second device is required.</p></div><button class="round-button" data-sheet-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button></header>
+      <div class="youtube-auth-body">
+        <div class="youtube-cookie" id="mp-youtube-cookie">
+          <div class="youtube-cookie-icon"><i class="fa-brands fa-google"></i></div>
+          <h3>Sign in normally</h3>
+          <p>AkiMelody opens YouTube Music in a private app window, recognizes when Google finishes signing in, and stores the resulting session only on this phone.</p>
+          <button class="youtube-primary" id="mp-youtube-cookie-start" type="button"><i class="fa-brands fa-google"></i> Sign in with Google</button>
+          <button class="youtube-help youtube-advanced" id="mp-youtube-advanced" type="button"><i class="fa-solid fa-sliders"></i> Advanced device-code setup</button>
+          <small>Google may reject embedded sign-in on some accounts. Advanced setup remains available as a fallback.</small>
+        </div>
+        <form class="youtube-config" id="mp-youtube-config" hidden>
+          <p>Fallback setup: enter a TV / limited-input OAuth client once. It stays in this app's private storage.</p>
+          <label><span>OAuth client ID</span><input id="mp-youtube-client-id" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+          <label><span>OAuth client secret</span><input id="mp-youtube-client-secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+          <a class="youtube-help" href="https://ytmusicapi.readthedocs.io/en/stable/setup/oauth.html"><i class="fa-solid fa-circle-question"></i> How to create the required Google credentials</a>
+          <button class="youtube-primary" type="submit"><i class="fa-brands fa-youtube"></i> Continue</button>
+        </form>
+        <div class="youtube-device" id="mp-youtube-device" hidden>
+          <p>Open Google on this phone, then enter this code:</p>
+          <button class="youtube-code" id="mp-youtube-code" type="button" aria-label="Copy authorization code">--- --- ---</button>
+          <button class="youtube-primary" id="mp-youtube-open" type="button"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open Google sign-in</button>
+          <span class="youtube-wait" id="mp-youtube-wait"><i class="fa-solid fa-circle-notch fa-spin"></i> Waiting for approval…</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="aki-toast" id="mp-toast" role="status" aria-live="polite"></div>
+  <audio id="mp-audio" preload="none"></audio>
+  <script src="/static/js/modules/spotify-importer.js"></script>
+  <script src="/static/js/mobile_player.js"></script>
+  <script>
+  // Mini-player + 3-tab pill nav bridge — keeps desktop untouched
+  (function(){
+    const mini = document.getElementById('mp-mini-player');
+    const miniArt = document.getElementById('mp-mini-art');
+    const miniTitle = document.getElementById('mp-mini-title');
+    const miniArtist = document.getElementById('mp-mini-artist');
+    const miniPlay = document.getElementById('mp-mini-play');
+    const art = document.getElementById('mp-art');
+    const title = document.getElementById('mp-title');
+    const artist = document.getElementById('mp-artist');
+    const audio = document.getElementById('mp-audio');
+    const playBtn = document.getElementById('mp-play');
+    function syncMini(){
+      if(!mini) return;
+      const hasTrack = title && title.textContent && title.textContent.trim() !== 'Not playing' && title.textContent.trim() !== 'AkiMelody';
+      mini.hidden = !hasTrack;
+      if(miniTitle) miniTitle.textContent = title ? title.textContent : 'Not playing';
+      if(miniArtist) miniArtist.textContent = artist ? artist.textContent : 'AkiMelody';
+      if(miniArt && art && art.src) { miniArt.src = art.src; miniArt.style.display = art.style.display === 'none' ? 'none' : 'block'; }
+      if(miniPlay && playBtn){
+        const isPlaying = playBtn.getAttribute('aria-pressed') === 'true' || (audio && !audio.paused);
+        miniPlay.innerHTML = isPlaying ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+        miniPlay.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+      }
+    }
+    // observe changes
+    if(title) new MutationObserver(syncMini).observe(title, {childList:true, characterData:true, subtree:true});
+    if(art) new MutationObserver(syncMini).observe(art, {attributes:true, attributeFilter:['src','style']});
+    if(playBtn) new MutationObserver(syncMini).observe(playBtn, {attributes:true, attributeFilter:['aria-pressed','class']});
+    if(audio){ audio.addEventListener('play', syncMini); audio.addEventListener('pause', syncMini); audio.addEventListener('emptied', syncMini); }
+    setInterval(syncMini, 1000);
+    document.addEventListener('DOMContentLoaded', syncMini);
+    // click handling
+    if(mini){
+      mini.addEventListener('click', (e)=>{
+        if(e.target.closest('#mp-mini-play')) return;
+        const target = document.querySelector('[data-view-target="player"]');
+        if(target) target.click();
+        else document.body.setAttribute('data-view','player');
+      });
+      mini.addEventListener('keydown', (e)=>{ if(e.key==='Enter' || e.key===' ') { e.preventDefault(); mini.click(); }});
+    }
+    if(miniPlay){
+      miniPlay.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        if(playBtn) playBtn.click();
+        else if(audio){ if(audio.paused) audio.play(); else audio.pause(); }
+      });
+    }
+    // Library/queue counters already update; mini visibility follows title
+  })();
+  </script>
+</body>
+</html>

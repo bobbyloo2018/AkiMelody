@@ -1,8 +1,9 @@
-﻿"""
+"""
 AkiMelody (秋メロディ) — Flask Backend
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response, redirect as _flask_redirect
+from flask import g, Flask, render_template, request, jsonify, send_from_directory, Response, redirect as _flask_redirect
+import uuid
 import requests
 try:
     from curl_cffi.requests import Session as _CurlSession
@@ -36,7 +37,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from ytmusicapi import YTMusic
 import ytmusic_auth as yauth
-from data_paths import prepare_data_paths, resolve_bundled_tool
+from data_paths import prepare_data_paths, resolve_bundled_tool, resolve_installation_dir
 from security_utils import (
     UPDATE_MAX_BYTES,
     env_flag,
@@ -63,7 +64,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.1.0"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -140,6 +141,10 @@ if LAN_ACCESS_ENABLED and len(LAN_ACCESS_TOKEN) < 20:
         "AKI_ALLOW_LAN requires AKI_LAN_TOKEN with at least 20 characters. "
         "Leave AKI_ALLOW_LAN unset for private localhost-only mode."
     )
+_accounts = None
+_account_library = None
+_account_data_lock = threading.RLock()
+
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request body
 
 
@@ -232,7 +237,7 @@ def _protect_local_service():
 def _no_store_word_sync(resp):
     # The Word Sync addon/fetcher are under active development; never let a
     # persistent browser/WebView2 cache serve stale copies.
-    if request.path.startswith("/static/js/word-"):
+    if request.path.startswith(("/static/js/word-", "/api/accounts/")):
         resp.headers["Cache-Control"] = "no-store"
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -374,9 +379,11 @@ _favorites_cache_ts = 0.0
 _FAVORITES_CACHE_TTL = 3.0
 
 # ── Listening stats storage ──────────────────────────────────────────────────
+import account_stats
+import calendar
 # Three-tier roll-up so the file stays compact for years:
 #   raw[]     — individual play events, capped at 28d, then rolled to daily
-#   daily[]   — one row per (Day, Track) -> {count, seconds}, capped at 1y, rolled to monthly
+#   daily[]   — per (Day, Track), current and previous calendar years
 #   monthly[] — one row per (Month, Track) -> {count, seconds}, kept forever
 #
 # All reads/writes happen under `_stats_lock`. `_stats_cache` is a snapshot
@@ -388,7 +395,6 @@ _stats_cache_ts = 0.0
 _STATS_CACHE_TTL = 5.0
 
 _STATS_RAW_TTL_DAYS = 28
-_STATS_DAILY_TTL_DAYS = 365
 _STATS_RAW_MAX = 30000
 _STATS_MONTH_KEY_FMT = "%Y-%m"
 _STATS_DAY_KEY_FMT = "%Y-%m-%d"
@@ -442,13 +448,16 @@ def _ts_to_month(ts):
 
 
 def _rollover_locked(data):
-    """Roll raw entries older than 28d into daily; daily older than 365d into monthly.
+    """Roll raw entries older than 28d into daily; older calendar years into monthly.
 
     Idempotent: a (day|month, track_key) row's `count` and `seconds` are summed so
     the same raw event rolled over twice never double-counts."""
     now_ms = time.time() * 1000.0
     raw_cutoff = now_ms - _STATS_RAW_TTL_DAYS * 86400000.0
-    daily_cutoff = now_ms - _STATS_DAILY_TTL_DAYS * 86400000.0
+    # Keep both calendar years in full so last year's Wrapped still works in January.
+    daily_cutoff_day = f"{time.gmtime(now_ms / 1000).tm_year - 1:04d}-01-01"
+    account_stats.initialize(data)
+    changed = False
 
     keep_raw = []
     daily = data.get("daily", {})
@@ -459,6 +468,7 @@ def _rollover_locked(data):
             keep_raw.append(ev)
             continue
         day = _ts_to_day(ev["ts"])
+        changed = True
         tkey = ev.get("id", "") or ""
         row = daily.setdefault(day, {}).setdefault(tkey, {"count": 0, "seconds": 0})
         # Only play=1 events increment the play count; progress events only
@@ -470,24 +480,42 @@ def _rollover_locked(data):
             play_corr = 0
         row["count"] += play_corr
         row["seconds"] += int(ev.get("sec", 0) or 0)
+        hours = data.setdefault("hours", {}).setdefault(day, [0, 0, 0, 0])
+        hours[time.gmtime(ev["ts"] / 1000).tm_hour // 6] += play_corr
 
     for day_key in list(daily.keys()):
         day_ts = None
         try:
-            day_ts = time.mktime(time.strptime(day_key, _STATS_DAY_KEY_FMT)) * 1000.0
+            day_ts = calendar.timegm(time.strptime(day_key, _STATS_DAY_KEY_FMT)) * 1000.0
         except Exception:
             continue
-        if day_ts < daily_cutoff:
+        if day_key < daily_cutoff_day:
+            changed = True
             month_key = day_key[:7]
             for tkey, v in daily[day_key].items():
                 row = monthly.setdefault(month_key, {}).setdefault(tkey, {"count": 0, "seconds": 0})
                 row["count"] += v.get("count", 0)
                 row["seconds"] += int(v.get("seconds", 0) or 0)
             del daily[day_key]
+            old_hours = data.setdefault("hours", {}).pop(day_key, [0, 0, 0, 0])
+            month_hours = data["hours"].setdefault(month_key, [0, 0, 0, 0])
+            for i, count in enumerate(old_hours):
+                month_hours[i] += count
 
+    # Overflow must be rolled up too, never silently discarded.
+    if len(keep_raw) > _STATS_RAW_MAX:
+        for ev in keep_raw[:-_STATS_RAW_MAX]:
+            day = _ts_to_day(ev["ts"])
+            row = daily.setdefault(day, {}).setdefault(ev["id"], {"count": 0, "seconds": 0})
+            row["count"] += int(ev.get("play", 0) == 1)
+            row["seconds"] += int(ev.get("sec", 0) or 0)
+            data.setdefault("hours", {}).setdefault(day, [0, 0, 0, 0])[time.gmtime(ev["ts"] / 1000).tm_hour // 6] += int(ev.get("play", 0) == 1)
+        changed = True
     data["raw"] = keep_raw[-_STATS_RAW_MAX:]
     data["daily"] = daily
     data["monthly"] = monthly
+    if changed:
+        data["revision"] += 1
     return data
 
 
@@ -509,12 +537,17 @@ def _track_meta_for_event(ev):
     }
 
 
-def _aggregate_locked(data, period_days=None):
+def _aggregate_locked(data, period_days=None, year=None):
     """Build the JSON response for /api/stats/get across raw + daily + monthly.
 
     period_days: None = all time, else look back N days for inclusion."""
+    data = account_stats.aggregate_document(data)
     now_ms = time.time() * 1000.0
     cutoff = 0.0 if period_days is None else (now_ms - period_days * 86400000.0)
+    end = float("inf")
+    if year is not None:
+        cutoff = calendar.timegm((year, 1, 1, 0, 0, 0)) * 1000
+        end = calendar.timegm((year + 1, 1, 1, 0, 0, 0)) * 1000
     by_track = {}
     today_start = _ts_to_day(now_ms + 1)
     today_plays = 0
@@ -525,7 +558,7 @@ def _aggregate_locked(data, period_days=None):
 
     for ev in data.get("raw", []):
         _lts = ev.get("ts", 0)
-        if _lts < cutoff:
+        if not cutoff <= _lts < end:
             continue
         # Honour the play/progress distinction stored at write-time. A "play"
         # event is the canonical count unit (one per completed 75%-boundary
@@ -556,10 +589,10 @@ def _aggregate_locked(data, period_days=None):
     # daily (older, exact day)
     for day_key, tracks in data.get("daily", {}).items():
         try:
-            day_ts = time.mktime(time.strptime(day_key, _STATS_DAY_KEY_FMT)) * 1000.0
+            day_ts = calendar.timegm(time.strptime(day_key, _STATS_DAY_KEY_FMT)) * 1000.0
         except Exception:
             continue
-        if day_ts < cutoff:
+        if not cutoff <= day_ts < end:
             continue
         for id_, v in tracks.items():
             total_plays += v["count"]
@@ -579,10 +612,10 @@ def _aggregate_locked(data, period_days=None):
     # monthly (oldest, lowest precision)
     for month_key, tracks in data.get("monthly", {}).items():
         try:
-            month_ts = time.mktime(time.strptime(month_key + "-01", _STATS_DAY_KEY_FMT)) * 1000.0
+            month_ts = calendar.timegm(time.strptime(month_key + "-01", _STATS_DAY_KEY_FMT)) * 1000.0
         except Exception:
             continue
-        if month_ts < cutoff:
+        if not cutoff <= month_ts < end:
             continue
         for id_, v in tracks.items():
             total_plays += v["count"]
@@ -595,6 +628,19 @@ def _aggregate_locked(data, period_days=None):
             t["count"] += v["count"]
             t["seconds"] += v["seconds"]
 
+    for tid, track in by_track.items():
+        metadata = data.get("metadata", {}).get(tid, {})
+        for key in ("title", "artist", "dur"):
+            if not track.get(key):
+                track[key] = metadata.get(key, track.get(key))
+    for date, counts in data.get("hours", {}).items():
+        try:
+            stamp = calendar.timegm(time.strptime(date + ("-01" if len(date) == 7 else ""), _STATS_DAY_KEY_FMT)) * 1000
+        except ValueError:
+            continue
+        if cutoff <= stamp < end:
+            for i, count in enumerate(counts):
+                hour_buckets[i] += count
     by_artist = {}
     for t in by_track.values():
         an = (t.get("artist") or "").strip().lower()
@@ -711,7 +757,7 @@ def _resolve_cookie_file() -> Path | None:
     """Find cookies.txt: check BASE_DIR first, then Tauri data dir."""
     if _yt_cookie_file.exists() and _yt_cookie_file.stat().st_size > 10:
         return _yt_cookie_file
-    if _tauri_cookie_file.exists() and _tauri_cookie_file.stat().st_size > 10:
+    if BASE_DIR == resolve_installation_dir() and _tauri_cookie_file.exists() and _tauri_cookie_file.stat().st_size > 10:
         return _tauri_cookie_file
     return None
 
@@ -722,40 +768,14 @@ def _parse_netscape_cookies(cookie_text: str, youtube_only: bool = False) -> str
     """Parse Netscape cookies.txt → semicolon-separated Cookie header string.
     If youtube_only=True, only include cookies from youtube.com domains
     (needed for music.youtube.com API — .google.com cookies cause auth rejection)."""
-    cookies = []
-    for line in cookie_text.splitlines():
-        if line.startswith('#') or not line.strip():
-            continue
-        parts = line.split('\t')
-        if len(parts) < 7:
-            continue
-        domain, _, _, _, _, name, value = parts[:7]
-        if youtube_only:
-            if 'youtube.com' in domain:
-                cookies.append(f"{name}={value}")
-        else:
-            if 'google.com' in domain or 'youtube.com' in domain:
-                cookies.append(f"{name}={value}")
-    return '; '.join(cookies)
+    from ytmusic_auth import parse_cookie_rows
+    return '; '.join(f"{c['name']}={c['value']}" for c in parse_cookie_rows(cookie_text, youtube_only))
 
 def _load_cookies_to_session(session, cookie_text: str):
     """Load Netscape cookies.txt into a requests.Session cookie jar with proper domain matching."""
-    import http.cookiejar
-    for line in cookie_text.splitlines():
-        if line.startswith('#') or not line.strip():
-            continue
-        parts = line.split('\t')
-        if len(parts) < 7:
-            continue
-        domain, _, path, secure, expires, name, value = parts[:7]
-        if 'google.com' in domain or 'youtube.com' in domain:
-            kwargs = {"domain": domain, "path": path}
-            if expires and expires != "0":
-                try:
-                    kwargs["expires"] = int(expires)
-                except Exception:
-                    pass
-            session.cookies.set(name, value, **kwargs)
+    from ytmusic_auth import parse_cookie_rows
+    for cookie in parse_cookie_rows(cookie_text):
+        session.cookies.set(**cookie)
 
 def _generate_auth_headers(cookie_text: str) -> bool:
     """Generate headers.json for ytmusicapi from cookies.txt content.
@@ -767,16 +787,12 @@ def _generate_auth_headers(cookie_text: str) -> bool:
         print("[AUTH] _generate_auth_headers: no cookies parsed from cookie text", flush=True)
         return False
 
-    # Extract SAPISID or __Secure-1PSID from parsed cookies for real SAPISIDHASH
-    sapisid = None
-    all_cookie_header = _parse_netscape_cookies(cookie_text, youtube_only=False)
-    for pair in (cookie_header + "; " + all_cookie_header).split("; "):
-        if pair.startswith("SAPISID="):
-            sapisid = pair.split("=", 1)[1]
-            break
-        if pair.startswith("__Secure-1PSID="):
-            sapisid = pair.split("=", 1)[1]
-            break
+    # Match ytmusicapi's browser signing cookie; SID cookies are not API keys.
+    from http.cookies import SimpleCookie
+    parsed = SimpleCookie()
+    parsed.load(cookie_header)
+    signing = parsed.get('__Secure-3PAPISID') or parsed.get('SAPISID')
+    sapisid = signing.value if signing else None
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -786,7 +802,7 @@ def _generate_auth_headers(cookie_text: str) -> bool:
         "X-Origin": "https://music.youtube.com",
     }
 
-    # Compute real SAPISIDHASH if SAPISID or __Secure-1PSID is present
+    # Compute the signature from the same YouTube cookies sent in the header.
     if sapisid:
         try:
             import ytmusic_auth as yauth
@@ -797,13 +813,13 @@ def _generate_auth_headers(cookie_text: str) -> bool:
             headers["authorization"] = "SAPISIDHASH 0_dummy"
     else:
         headers["authorization"] = "SAPISIDHASH 0_dummy"
-        print("[AUTH] No SAPISID/__Secure-1PSID cookie found — using placeholder SAPISIDHASH", flush=True)
+        print("[AUTH] No YouTube API signing cookie found — using placeholder SAPISIDHASH", flush=True)
 
     try:
         _yt_headers_file.write_text(json.dumps(headers, indent=2), encoding="utf-8")
         # Log which auth cookies are present for diagnostics
         names = [p.split("=", 1)[0] for p in cookie_header.split("; ") if "=" in p]
-        all_names = [p.split("=", 1)[0] for p in (cookie_header + "; " + all_cookie_header).split("; ") if "=" in p]
+        all_names = names
         has_sapisid = "SAPISID" in all_names
         has_secure_1psid = "__Secure-1PSID" in all_names
         has_sid = "SID" in all_names
@@ -1218,11 +1234,11 @@ def _init_ytmusic():
             print(f"[INIT] YTMusic OAuth init failed ({e}), trying browser auth", flush=True)
     if has_valid_auth_state():
         try:
-            session = _BoundedRequestsSession()
             cookie_file = _resolve_cookie_file()
+            session = _BoundedRequestsSession()
             if cookie_file:
-                _load_cookies_to_session(session, cookie_file.read_text(encoding="utf-8"))
-                session.cookies.set("SOCS", "CAI", domain=".youtube.com")
+                from ytmusic_session import YouTubeBrowserSession
+                session = YouTubeBrowserSession(cookie_file)
             ytm = YTMusic(str(_yt_headers_file), requests_session=session)
             # Clear ytmusicapi's own cookies dict so cookies={"SOCS":"CAI"} is NOT
             # passed to session.post() — we handle cookies via the session jar instead
@@ -1241,24 +1257,8 @@ def _rebuild_ytmusic_auth():
     """Re-read cookies.txt and rebuild YTMusic auth. Called after login/link."""
     global ytmusic, _auth_state_ok
 
-    # Check if ytmusic_auth already has a valid auth file (from popup flow)
-    try:
-        auth_st = yauth.get_auth_status()
-        if auth_st.get("authenticated"):
-            print(f"[AUTH] Rebuild: ytmusic_auth already has valid auth ({auth_st['size']} bytes at {auth_st['path']})", flush=True)
-            # Verify it still works
-            if yauth.verify_auth(auth_st["path"]):
-                print("[AUTH] Rebuild: auth verified OK — skipping regeneration", flush=True)
-                _auth_state_ok = True
-                ytmusic = _init_ytmusic()
-                _invalidate_stream_cache()
-                return True
-            else:
-                print("[AUTH] Rebuild: auth verification failed — falling back to cookies", flush=True)
-    except Exception as exc:
-        print(f"[AUTH] Rebuild: ytmusic_auth check failed: {exc}", flush=True)
-
-    # Fall back to cookies.txt → headers.json regeneration
+    # Always rebuild from the latest browser snapshot; an older header file
+    # must not bypass freshly recovered cookies.
     cookie_file = _resolve_cookie_file()
     if cookie_file:
         print(f"[AUTH] Rebuild: reading cookies from {cookie_file} ({cookie_file.stat().st_size} bytes)", flush=True)
@@ -2720,18 +2720,17 @@ def _upscale_thumb(url: str) -> str:
     return url
 
 def _parse_duration(track: dict) -> int:
-    dur_sec = track.get("duration_seconds")
-    if dur_sec is not None:
-        try: return int(dur_sec)
-        except (ValueError, TypeError): pass
-    dur_str = track.get("duration") or "0:00"
-    if isinstance(dur_str, (int, float)):
-        return int(dur_str)
-    parts = str(dur_str).split(":")
-    try:
-        return int(parts[0]) * 60 + int(parts[1]) if len(parts) == 2 else int(parts[0])
-    except (ValueError, IndexError):
-        return 0
+    # Watch/radio results use length; get_song uses lengthSeconds. A zero in
+    # one alias must not mask a known duration in another.
+    for key in ("dur", "duration_seconds", "duration", "lengthSeconds", "length"):
+        try:
+            parts = str(track.get(key) or "0").split(":")
+            seconds = sum(float(value) * 60 ** index for index, value in enumerate(reversed(parts)))
+            if 0 < seconds <= 86400:
+                return int(seconds)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return 0
 
 def _yt_track_to_dict(e, default_artist):
     """Normalize a raw YT Music track entry into the project Track Schema
@@ -3070,7 +3069,7 @@ def _playlist_meta_payload(track: dict, track_number=None, added_at=None) -> dic
     return {
         "name": track.get("name", track.get("tid", "Unknown")),
         "artist": track.get("artist", "Unknown Artist"),
-        "dur": _coerce_playlist_duration(track.get("dur")),
+        "dur": _coerce_playlist_duration(track.get("dur") or track.get("duration") or track.get("length")),
         "art": track.get("art", ""),
         "trackNumber": number,
         "videoId": track.get("videoId", ""),
@@ -3196,8 +3195,10 @@ def _write_playlist_meta_locked(track: dict, playlist_name: str, track_number=No
     tid = track.get("tid") or get_track_id(track.get("name", ""), track.get("artist", ""))
     if not tid:
         return "", False
+    adapter = globals().get("_account_library")
+    readded = adapter.add_to_overlay(track, playlist_name) if adapter else False
     if tid in _playlist_existing_tids_locked(pl_dir):
-        return tid, False
+        return tid, readded
     requested_number = _coerce_track_number(track_number)
     used_numbers = _playlist_track_numbers_locked(pl_dir)
     number = requested_number if requested_number and requested_number not in used_numbers else ((max(used_numbers) if used_numbers else 0) + 1)
@@ -3897,8 +3898,23 @@ def api_favorites():
 def api_save_favorites():
     try:
         favs = request.get_json(force=True)
+        if isinstance(favs, dict):
+            # Membership intent avoids overwriting unseen likes from another device.
+            track, liked = favs.get("track"), favs.get("liked")
+            if not isinstance(track, dict) or type(liked) is not bool or not track.get("name") or not track.get("artist"):
+                return jsonify({"error": "Invalid favorite change"}), 400
+            track = standardize_track({**track, "tid": get_track_id(track["name"], track["artist"])})
+            favs = [f for f in _load_favorites() if f.get("tid") != track["tid"]]
+            if liked:
+                favs.append(track)
+        if not isinstance(favs, list) or any(not isinstance(f, dict) for f in favs):
+            return jsonify({"error": "Invalid favorites"}), 400
         _atomic_write_json(FAVORITES_JSON, favs)
         _invalidate_favorites_cache()
+        if _account_library:
+            _account_library.schedule_artwork()
+        if _accounts:
+            _accounts.generation += 1
         # Only enqueue favourites that are genuinely missing material locally.
         # The previous version submitted the ENTIRE favourites list to the bounded
         # download executor on every single like/unlike toggle — N yt-dlp task
@@ -3934,9 +3950,12 @@ def api_stats_log():
         return jsonify({"error": "invalid json"}), 400
     ev_type = (body.get("type") or "").strip()
     tid = (body.get("id") or "").strip()
-    if not tid or ev_type not in ("play", "progress"):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,150}", tid) or ev_type not in ("play", "progress"):
         return jsonify({"error": "bad payload"}), 400
-    sec = int(body.get("sec", 0) or 0)
+    try:
+        sec = min(86400, int(body.get("sec", 0) or 0))
+    except (ValueError, TypeError, OverflowError):
+        return jsonify({"error": "bad seconds"}), 400
     if sec < 0:
         sec = 0
     raw_dur = body.get("dur", 0) or 0
@@ -3976,6 +3995,7 @@ def api_stats_log():
                 "dur": dur, "sec": sec, "ts": ts, "play": 0
             })
         _rollover_locked(data)
+        data["revision"] += 1
         _save_stats_locked(data)
         _invalidate_stats_cache()
     return jsonify({"ok": True})
@@ -3986,14 +4006,21 @@ def api_stats_get():
     global _stats_cache, _stats_cache_ts
     period = (request.args.get("period") or "all").strip().lower()
     pm = {"week": 7, "month": 30, "year": 365}.get(period)
+    year = request.args.get("year")
+    if year is not None:
+        if not re.fullmatch(r"\d{4}", year) or not 1970 <= int(year) <= 9998:
+            return jsonify({"error": "invalid year"}), 400
+        year = int(year)
     now = time.time()
-    if _stats_cache is not None and (now - _stats_cache_ts) < _STATS_CACHE_TTL and _stats_cache.get("_period") == period:
+    if _stats_cache is not None and (now - _stats_cache_ts) < _STATS_CACHE_TTL and _stats_cache.get("_period") == period and _stats_cache.get("_year") == year:
         return jsonify(_stats_cache)
     with _stats_lock:
         data = _load_stats_locked()
         _rollover_locked(data)
-        out = _aggregate_locked(data, pm)
+        out = _aggregate_locked(data, pm, year=year)
+        _save_stats_locked(data)
     out["_period"] = period
+    out["_year"] = year
     _stats_cache = out
     _stats_cache_ts = now
     return jsonify(out)
@@ -4056,6 +4083,7 @@ def api_stats_import():
             rolled_month.add((tid, month_key))
             imported += 1
         _rollover_locked(data)
+        data["revision"] += 1
         _save_stats_locked(data)
         _invalidate_stats_cache()
     return jsonify({"ok": True, "imported": imported})
@@ -4064,7 +4092,9 @@ def api_stats_import():
 @app.route("/api/stats/reset", methods=["POST"])
 def api_stats_reset():
     with _stats_lock:
-        _save_stats_locked(_empty_stats_doc())
+        data = _load_stats_locked()
+        account_stats.reset(data)
+        _save_stats_locked(data)
         _invalidate_stats_cache()
     return jsonify({"ok": True})
 
@@ -4408,6 +4438,14 @@ def api_album():
             vid = e.get("videoId", "")
             tid = get_track_id(name, artist)
             tracks.append(_build_track_dict(name, artist, art, dur, tid, vid, album_id, trackNumber=idx))
+        if tracks:
+            # One recording-aware lookup provides the release cover for the album.
+            cover = resolve_artwork_batch([{**tracks[0], "album": title}])[0]
+            if cover.get("art_source") == "apple":
+                album_art = cover["art"]
+                for track in tracks:
+                    track.update(art=album_art, album_art=album_art, album=title,
+                                 art_source="apple", art_candidates=cover.get("art_candidates", []))
         payload = {"title": title, "artist": album_artist, "art": album_art, "tracks": tracks}
         with _album_lock:
             _album_cache[album_id] = (now, payload)
@@ -4462,7 +4500,10 @@ def _scan_playlists():
                 continue
             audio_files = sorted(f for f in files if f.suffix.lower() in _LOCAL_AUDIO_EXTENSIONS)
             meta_files = sorted(f for f in files if f.name.endswith(".meta.json"))
-            if not audio_files and not meta_files:
+            account_meta = _read_playlist_json(entry / "playlist.json", "playlist metadata")
+            if account_meta.get("accountDeleted"):
+                continue
+            if not audio_files and not meta_files and "accountItems" not in account_meta:
                 continue
             audio_tids = {_tid_from_audio_filename(path) for path in audio_files}
             valid_meta = {}
@@ -4471,16 +4512,16 @@ def _scan_playlists():
                 meta = _read_track_meta(meta_path, tid)
                 if meta:
                     valid_meta[tid] = meta
-            if not audio_files and not valid_meta:
+            if not audio_files and not valid_meta and "accountItems" not in account_meta:
                 continue
-            count = len(audio_tids | set(valid_meta))
+            count = len(account_meta["accountItems"]) if "accountItems" in account_meta else len(audio_tids | set(valid_meta))
             playlist_meta = _read_playlist_json(entry / "playlist.json", "playlist metadata")
             album_meta = _read_playlist_json(entry / "album.json", "album metadata")
             cover_art = ""
             local_cover = entry / "cover.jpg"
             try:
                 if local_cover.exists() and local_cover.stat().st_size > 100:
-                    cover_art = f"/api/library_file?q={entry.name}/cover.jpg"
+                    cover_art = f"/api/library_file?q={urllib.parse.quote(entry.name)}/cover.jpg&cv=2&v={local_cover.stat().st_mtime_ns}"
             except OSError:
                 pass
             if not cover_art:
@@ -4555,6 +4596,15 @@ def api_playlists_create():
     with _playlist_catalog_lock:
         target = PLAYLISTS_DIR / safe_name
         if target.exists():
+            if globals().get("_account_library") and _account_library._meta(target / "playlist.json").get("accountDeleted"):
+                with _playlist_guard(safe_name):
+                    known = [p.stem for p in target.glob("*.mp3")]
+                    known.extend(p.name[:-10] for p in target.glob("*.meta.json"))
+                    _atomic_write_json(target / "playlist.json", {"accountId": str(uuid.uuid4()),
+                        "accountName": safe_name, "accountItems": [], "accountKnownTids": sorted(set(known))})
+                _invalidate_playlist_cache()
+                _invalidate_file_index()
+                return jsonify({"success": True, "name": safe_name})
             return jsonify({"error": "Playlist already exists"}), 409
         with _playlist_guard(safe_name):
             target.mkdir(parents=True, exist_ok=False)
@@ -4902,7 +4952,10 @@ def api_playlists_metadata():
             with _playlist_guard(safe_name):
                 pl_dir = PLAYLISTS_DIR / safe_name
                 pl_dir.mkdir(parents=True, exist_ok=True)
-                _atomic_write_json(pl_dir / "playlist.json", meta)
+                existing = {}
+                if (pl_dir / "playlist.json").exists():
+                    existing = json.loads((pl_dir / "playlist.json").read_text(encoding="utf8"))
+                _atomic_write_json(pl_dir / "playlist.json", {**existing, **meta})
         _invalidate_playlist_cache()
         return jsonify({"success": True})
     except Exception as e:
@@ -4955,7 +5008,7 @@ def api_playlists_enrich_artwork():
             if not meta:
                 continue
             existing_candidates = meta.get("art_candidates") if isinstance(meta.get("art_candidates"), list) else []
-            if meta.get("art_resolved_at") and len(existing_candidates) >= 2:
+            if not force and meta.get("art_resolved_at") and len(existing_candidates) >= 2:
                 continue
             pending.append((mf, meta, meta.get("art", "") or meta.get("album_art", "")))
 
@@ -4965,7 +5018,19 @@ def api_playlists_enrich_artwork():
             _set_job(status="complete", finishedAt=time.time())
             return
 
-        results = resolve_artwork_batch([meta for _mf, meta, _art in pending], force=force)
+        album_meta = _read_playlist_json(pl_dir / "album.json", "album metadata")
+        album_title = album_meta.get("title") or ""
+        results = resolve_artwork_batch([
+            {**meta, **({"album": album_title} if album_title else {})}
+            for _mf, meta, _art in pending], force=force)
+        verified_cover = next((r for r in results if album_title and r.get("art_source") == "apple"
+                               and r.get("art_confidence", 0) >= 112), None)
+        if verified_cover:
+            for result in results:
+                result.update({k: verified_cover[k] for k in
+                    ("art", "album_art", "art_candidates", "art_source", "art_confidence") if k in verified_cover})
+        downloaded_art = {}
+
         resolved_count = downloaded_count = missing_count = 0
         for (mf, meta, art_before), enriched in zip(pending, results):
             try:
@@ -4973,7 +5038,12 @@ def api_playlists_enrich_artwork():
                 tid = mf.stem.replace(".meta", "")
                 art_path = pl_dir / f"{tid}.jpg"
                 candidates = enriched.get("art_candidates") or ([new_art] if new_art else [])
-                art_bytes, working_url = (None, "") if art_path.exists() else _download_first_artwork(candidates)
+                art_bytes, working_url = (None, "")
+                if force or not art_path.exists():
+                    cache_key = tuple(candidates)
+                    if cache_key not in downloaded_art:
+                        downloaded_art[cache_key] = _download_first_artwork(candidates)
+                    art_bytes, working_url = downloaded_art[cache_key]
                 if working_url:
                     new_art = working_url
                 with _playlist_guard(safe_name):
@@ -4998,7 +5068,7 @@ def api_playlists_enrich_artwork():
                         current["recording_confidence"] = enriched["recording_confidence"]
                     current["art_resolved_at"] = time.time()
                     _atomic_write_json(mf, current)
-                    if art_bytes and not art_path.exists():
+                    if art_bytes and (force or not art_path.exists()):
                         tmp_art = art_path.with_suffix(".jpg.tmp")
                         tmp_art.write_bytes(art_bytes)
                         os.replace(tmp_art, art_path)
@@ -5016,6 +5086,17 @@ def api_playlists_enrich_artwork():
                 log.warning(f"Artwork enrichment failed for {mf.name}: {e}")
                 missing_count += 1
                 _set_job(processed=resolved_count + missing_count, missing=missing_count)
+        if verified_cover:
+            cover_bytes, cover_url = downloaded_art.get(tuple(verified_cover.get("art_candidates", [])), (None, ""))
+            if cover_bytes and cover_url == verified_cover.get("art"):
+                with _playlist_guard(safe_name):
+                    if pl_dir.exists() and (pl_dir / "album.json").exists():
+                        current_album = _read_playlist_json(pl_dir / "album.json", "album metadata")
+                        current_album.update(art=cover_url, art_source="apple", art_resolved_at=time.time())
+                        _atomic_write_json(pl_dir / "album.json", current_album)
+                        cover_tmp = pl_dir / "cover.jpg.tmp"
+                        cover_tmp.write_bytes(cover_bytes)
+                        os.replace(cover_tmp, pl_dir / "cover.jpg")
         _invalidate_file_index()
         _invalidate_playlist_cache()
         _set_job(
@@ -5223,7 +5304,8 @@ def _load_playlist_tracks_unlocked(safe_name: str) -> list:
             })
             have_audio.add(tid)  # avoid double-counting if stem parsing was ambiguous
     tracks.sort(key=lambda x: x.get("trackNumber") or 999)
-    return tracks
+    adapter = globals().get("_account_library")
+    return adapter.overlay_tracks(safe_name, tracks) if adapter else tracks
 
 
 def _load_playlist_tracks(safe_name: str) -> list:
@@ -5250,7 +5332,7 @@ def _playlist_export_track(track: dict) -> dict:
         "name": track.get("name", ""),
         "artist": track.get("artist", ""),
         "tid": get_track_id(track.get("name", ""), track.get("artist", "")),
-        "dur": _coerce_playlist_duration(track.get("dur")),
+        "dur": _coerce_playlist_duration(track.get("dur") or track.get("duration") or track.get("length")),
         "art": track.get("art", ""),
         "videoId": track.get("videoId", ""),
         "albumId": track.get("albumId", ""),
@@ -5476,12 +5558,26 @@ def _apply_playlist_import(parsed: dict, mode: str, requested_name: str) -> dict
 @app.route("/api/library_file")
 def api_library_file():
     q = request.args.get("q", "")
-    filename = Path(q).name
-    if not filename or filename == "." or filename == ".." or not _SAFE_FILENAME_RE.match(filename):
+    if "\\" in q:
         return jsonify({"error": "Not found"}), 404
-    # Use reverse index instead of rglob
-    idx = _get_file_index()
-    matched = idx.get(filename)
+    parts = q.split("/")
+    filename = parts[-1]
+    if not filename or filename in (".", "..") or not _SAFE_FILENAME_RE.fullmatch(filename):
+        return jsonify({"error": "Not found"}), 404
+    if len(parts) > 1:
+        # Album covers share a filename: preserve the requested collection path.
+        if len(parts) != 2 or parts[0] in ("", ".", "..") or ":" in parts[0]:
+            return jsonify({"error": "Not found"}), 404
+        root = PLAYLISTS_DIR.resolve()
+        matched = (root / parts[0] / filename).resolve()
+        if not matched.is_relative_to(root):
+            return jsonify({"error": "Not found"}), 404
+    else:
+        # Legacy recording-ID URLs retain the cached index, but a bare cover
+        # filename cannot identify an album and must never select one arbitrarily.
+        if filename.lower() == "cover.jpg":
+            return jsonify({"error": "Not found"}), 404
+        matched = _get_file_index().get(filename)
     if matched and matched.is_file():
         response = send_from_directory(
             str(matched.parent), matched.name, conditional=True, mimetype=_local_media_mimetype(matched)
@@ -5524,8 +5620,11 @@ def api_settings_wipe():
             failed += 1
 
     try:
-        _atomic_write_json(STATS_JSON, _empty_stats_doc())
-        _invalidate_stats_cache()
+        with _stats_lock:
+            stats = _load_stats_locked()
+            account_stats.reset(stats)
+            _save_stats_locked(stats)
+            _invalidate_stats_cache()
     except OSError:
         failed += 1
 
@@ -5577,7 +5676,15 @@ def api_toggle_community_showcase():
 @app.route("/api/youtube/refresh_auth", methods=["POST"])
 def api_refresh_youtube_auth():
     """Re-read cookies.txt and rebuild YTMusic auth headers. Called after Tauri login."""
-    ok = _rebuild_ytmusic_auth()
+    global _ytmusic_connection_state, _ytmusic_auth_rebuild_last, _ytmusic_auth_rebuild_result
+    with _ytmusic_auth_rebuild_lock:
+        ok = _rebuild_ytmusic_auth()
+        _ytmusic_auth_rebuild_last = time.monotonic()
+        _ytmusic_auth_rebuild_result = bool(ok)
+        if ok:
+            _ytmusic_connection_state = 'saved'
+            with _liked_lock:
+                _liked_cache.clear()
     if ok:
         return jsonify({"success": True, "message": "YouTube auth refreshed"})
     return jsonify({"success": False, "message": "No valid cookies found"}), 400
@@ -5812,17 +5919,19 @@ def api_youtube_auth_status():
     oauth_credentials = bool(_load_youtube_oauth_credentials())
     oauth_token = _has_youtube_oauth_state()
 
-    # Check if headers.json is potentially expired (SAPISIDHASH expires ~2 hours)
+    # Retain file age for diagnostics only, never as an expiry heuristic.
     headers_age = 0
     if _yt_headers_file.exists():
         try:
             headers_age = time.time() - _yt_headers_file.stat().st_mtime
         except Exception:
             pass
-    headers_potentially_expired = headers_age > 7200  # 2 hours
+    # ytmusicapi signs every browser-auth request; disk age is not login expiry.
+    headers_potentially_expired = False
 
     return jsonify({
-        "authenticated": has_headers and not headers_potentially_expired,
+        "authenticated": has_headers and _ytmusic_connection_state != 'reconnect_required',
+        "connection_state": _ytmusic_connection_state if has_headers else 'not_linked',
         "cookies": has_cookies,
         "ytmusic_auth": has_headers,
         "ytmusic_authenticated": has_headers,
@@ -5850,32 +5959,42 @@ def _fetch_youtube_likes_raw(limit: int, timeout: int = 18) -> dict:
 # Matches upstream ytmusicapi/HTTP messages that indicate the embedded
 # SAPISIDHASH or session cookies expired. Used to trigger one bounded
 # rebuild+retry instead of misreporting a logged-in session as "unauthenticated".
-_YTMUSIC_AUTH_FAIL_RE = re.compile(r"401|unauthorized|unauthenticated", re.I)
+_YTMUSIC_AUTH_FAIL_RE = re.compile(r"401|unauthorized|unauthenticated|SIGN_IN_REQUIRED|please sign in|not logged in", re.I)
+_youtube_browser_refresh = None  # Desktop shell supplies a private, local recovery hook.
 _ytmusic_auth_rebuild_lock = threading.Lock()
 _ytmusic_auth_rebuild_last = 0.0
+_ytmusic_auth_rebuild_result = False
+_ytmusic_connection_state = 'saved'
 _YTMUSIC_AUTH_REBUILD_COOLDOWN = 60.0
 
 
 def _maybe_rebuild_ytmusic_auth() -> bool:
-    """Cooldown-bounded, single-flight auth rebuild. Regenerating headers.json
-    refreshes the embedded SAPISIDHASH timestamp, which covers the long-session
-    case where an otherwise-valid login slowly stops authenticating."""
-    global _ytmusic_auth_rebuild_last
+    """Share one rebuild from saved credentials, including its cooldown result.
+    The client already refreshes SAPISIDHASH on each request."""
+    global _ytmusic_auth_rebuild_last, _ytmusic_auth_rebuild_result
     with _ytmusic_auth_rebuild_lock:
-        now = time.time()
+        now = time.monotonic()
         if now - _ytmusic_auth_rebuild_last < _YTMUSIC_AUTH_REBUILD_COOLDOWN:
-            return False
-        _ytmusic_auth_rebuild_last = now
-    try:
-        return bool(_rebuild_ytmusic_auth())
-    except Exception as exc:
-        log.warning(f"Implicit YouTube auth rebuild failed: {exc}")
-        return False
+            return _ytmusic_auth_rebuild_result
+        try:
+            refresh_browser = globals().get('_youtube_browser_refresh')
+            if callable(refresh_browser):
+                refresh_browser()
+            _ytmusic_auth_rebuild_result = bool(_rebuild_ytmusic_auth())
+        except Exception:
+            log.warning('Implicit YouTube auth rebuild failed')
+            _ytmusic_auth_rebuild_result = False
+        _ytmusic_auth_rebuild_last = time.monotonic()
+        return _ytmusic_auth_rebuild_result
 
 
 @app.route("/api/youtube/liked_songs")
 def api_youtube_liked_songs():
     """Fetch the user's liked songs from YouTube Music (requires auth)."""
+    global _ytmusic_connection_state
+    # Google's videos.list(myRating=like) contains general YouTube videos,
+    # not the user's YouTube Music library. Never substitute it here, even
+    # when the account has a Google YouTube grant or Music needs reconnecting.
     if not has_valid_auth_state():
         # cookies.txt can appear after startup (web login race, migration).
         # Give the cached state one bounded rebuild from the cookie file before
@@ -5892,12 +6011,12 @@ def api_youtube_liked_songs():
         try:
             result = _fetch_youtube_likes_raw(limit)
         except Exception as first_err:
-            # Auth-flavoured failures can come from a stale SAPISIDHASH on a
-            # genuinely-logged-in session (playback keeps working because
-            # streaming doesn't need SAPISIDHASH). Rebuild once and retry.
+            # Reload saved credentials once before asking the user to reconnect.
+            # Request signatures are refreshed by ytmusicapi itself.
             if not (_YTMUSIC_AUTH_FAIL_RE.search(str(first_err)) and _maybe_rebuild_ytmusic_auth()):
                 raise
             result = _fetch_youtube_likes_raw(limit)
+        _ytmusic_connection_state = 'connected'
         tracks = []
         for t in result.get("tracks", []):
             if not t or t.get("videoId") is None:
@@ -5914,7 +6033,7 @@ def api_youtube_liked_songs():
             a_id = (t.get("album") or {}).get("id", "")
             tracks.append(_build_track_dict(name, artist_name, art, dur_sec, tid, t.get("videoId", ""), a_id,
                 title=name, artist_name=artist_name, album_art=art, duration=t.get("duration", "")))
-        payload = {"tracks": tracks, "total": result.get("trackCount", len(tracks))}
+        payload = {"tracks": tracks, "total": result.get("trackCount", len(tracks)), "source": "youtube_music"}
         with _liked_lock:
             _liked_cache[limit] = (now, payload)
         return jsonify(payload)
@@ -5922,6 +6041,7 @@ def api_youtube_liked_songs():
         msg = str(e)
         log.warning(f"YouTube liked songs fetch failed: {msg}")
         if _YTMUSIC_AUTH_FAIL_RE.search(msg):
+            _ytmusic_connection_state = 'reconnect_required'
             return jsonify({"error": "not_authenticated", "tracks": []}), 401
         return jsonify({"error": msg, "transient": True, "tracks": []}), 500
 
@@ -6021,7 +6141,10 @@ def standardize_track(track):
     # Standardize Artwork
     thumbs = track.get("thumbnails")
     current_art = ""
-    if thumbs and isinstance(thumbs, list) and len(thumbs) > 0:
+    if (track.get("art_source") in ("apple", "spotify") or
+            "mzstatic.com/" in str(track.get("album_art") or track.get("art") or "")):
+        current_art = track.get("album_art") or track.get("art") or ""
+    if not current_art and thumbs and isinstance(thumbs, list) and len(thumbs) > 0:
         current_art = thumbs[-1].get("url") or ""
     
     if not current_art:
@@ -6225,6 +6348,107 @@ def _radio_suggest_tracks(vid):
         if len(_radio_suggest_cache) > _RADIO_SUGGEST_CACHE_MAX:
             _radio_suggest_cache.popitem(last=False)
     return sanitized_tracks
+
+def _recover_saved_metadata(track):
+    duration = _parse_duration(track)
+    if not duration:
+        try:
+            vid = track.get("videoId")
+            if vid:
+                details = ytmusic.get_song(vid).get("videoDetails", {})
+                duration = _parse_duration(details)
+            if not duration:
+                recording = resolve_recording(track["name"], track["artist"],
+                    album=track.get("album") or track.get("albumName", ""),
+                    album_id=track.get("albumId", ""))
+                duration = _parse_duration(recording or {})
+        except Exception as exc:
+            log.debug("Saved metadata recovery unavailable: %s", type(exc).__name__)
+    if duration:
+        track["dur"] = track["duration"] = duration
+    return track
+
+
+def _discovery_taste():
+    library = _account_library.collect(include_stats=False)
+    with _stats_lock:
+        stats = account_stats.aggregate_document(_load_stats_locked())
+    return library, stats
+
+
+def _discovery_related(seed):
+    vid = seed.get("videoId")
+    if not vid:
+        recording = resolve_recording(seed["name"], seed["artist"],
+            duration=seed.get("duration") or seed.get("dur"),
+            album=seed.get("albumName", ""), album_id=seed.get("albumId", ""))
+        vid = (recording or {}).get("videoId")
+    if not vid:
+        return []
+    rows = ytmusic.get_watch_playlist(videoId=vid, limit=50, radio=True).get("tracks", []) or []
+    return [_yt_track_to_dict(row, "") for row in rows[:50]
+            if row.get("videoId") and row.get("title") and row.get("artists")]
+
+
+_discovery_service = None
+_discovery_service_lock = threading.Lock()
+
+
+def _discovery_fresh(seed):
+    from discovery import normalized, recent_release
+    response = _itunes_session.get('https://itunes.apple.com/search', params={
+        'term': seed['artist'], 'media': 'music', 'entity': 'song',
+        'limit': 50, 'country': 'US', 'lang': 'en_us'}, timeout=10)
+    response.raise_for_status()
+    tracks = []
+    for row in response.json().get('results', [])[:50]:
+        if normalized(row.get('artistName')) != normalized(seed['artist']) or not row.get('trackId'):
+            continue
+        date = row.get('releaseDate')
+        if not recent_release({'releaseDate': date, 'releaseSource': 'apple'}, time.time(), days=None):
+            continue
+        name, artist = row.get('trackName'), row.get('artistName')
+        if not name or not artist:
+            continue
+        track = _build_track_dict(name, artist, row.get('artworkUrl100', ''),
+            int(row.get('trackTimeMillis') or 0) // 1000, get_track_id(name, artist), '', '')
+        track.update(releaseDate=date, releaseSource='apple', catalogId=str(row['trackId']),
+                     albumName=row.get('collectionName', ''))
+        tracks.append(track)
+    return sorted(tracks, key=lambda t:t['releaseDate'], reverse=True)
+
+
+def _get_discovery():
+    global _discovery_service
+    with _discovery_service_lock:
+        if _discovery_service is None:
+            from discovery import Discovery
+            _discovery_service = Discovery(BASE_DIR / "discovery.json", _discovery_taste,
+                                           _discovery_related, resolve_artwork_batch, fresh=_discovery_fresh,
+                                           artist_image=get_artist_image_cached)
+        return _discovery_service
+
+
+@app.route("/api/discovery", methods=["GET"])
+def api_discovery():
+    return jsonify(_get_discovery().get())
+
+
+@app.route("/api/discovery/refresh", methods=["POST"])
+def api_discovery_refresh():
+    return jsonify(_get_discovery().get(refresh=True))
+
+
+@app.route("/api/discovery/feedback", methods=["POST"])
+def api_discovery_feedback():
+    data = request.get_json(silent=True) or {}
+    try:
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str) or not isinstance(data.get("action"), str):
+            raise ValueError("Choose a pick and a feedback action")
+        return jsonify(_get_discovery().feedback(data["id"], data["action"]))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
 
 @app.route("/api/lyrics")
 def api_lyrics():
@@ -8491,6 +8715,125 @@ def api_update_changelog():
     })
 
 
+
+
+# ── Desktop accounts: local routes keep cloud credentials out of JavaScript ──
+@app.before_request
+def _account_request_guard():
+    if request.path.startswith("/api/accounts/"):
+        host = urllib.parse.urlparse("http://" + request.host).hostname
+        if not is_loopback_address(request.remote_addr) or host not in {"localhost", "127.0.0.1", "::1"}:
+            return jsonify({"error": "local_account_access_required"}), 403
+        if request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify({"error": "cross_origin_request_blocked"}), 403
+        if not _accounts:
+            return jsonify({"error": "accounts_unavailable"}), 503
+        if request.method != "GET" and not secrets.compare_digest(request.headers.get("X-Aki-Account-CSRF", ""), _accounts.capability):
+            return jsonify({"error": "invalid_account_request"}), 403
+    elif request.method in {"POST", "PUT", "DELETE", "PATCH"}:
+        if _accounts and _accounts.restart_required:
+            return jsonify({"error": "account_restart_required"}), 409
+        if request.path.startswith(("/api/playlists/", "/api/settings", "/api/save_favorites", "/api/spotify/", "/api/stats/")):
+            _account_data_lock.acquire()
+            g.account_data_locked = True
+
+
+@app.teardown_request
+def _account_release_request_lock(_error=None):
+    if getattr(g, "account_data_locked", False):
+        g.account_data_locked = False
+        _account_data_lock.release()
+        # Listening pulses ride the existing 15-minute sync; never one cloud write per pulse.
+        if _accounts and (not request.path.startswith("/api/stats/") or request.path == "/api/stats/reset"):
+            _accounts.notify_change()
+
+
+@app.route("/api/accounts/status")
+def api_accounts_status():
+    response = jsonify({**_accounts.status(), "capability": _accounts.capability})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/accounts/signin", methods=["POST"])
+def api_accounts_signin():
+    from account_local import CloudError, CredentialUnavailable
+    try:
+        data = request.get_json(silent=True) or {}
+        if IS_ANDROID:
+            return jsonify({"error": "Desktop accounts are available on Windows first"}), 409
+        url = _accounts.start_login(import_local=data.get("importLocal") is True, youtube=data.get('youtube') is True)
+        _accounts.wake.set()
+        return jsonify({"authorizationUrl": url})
+    except (CloudError, requests.RequestException, CredentialUnavailable, ValueError):
+        return jsonify({"error": "Sign-in could not start. Check account service configuration and try again."}), 503
+
+
+@app.route("/api/accounts/cancel", methods=["POST"])
+def api_accounts_cancel():
+    with _accounts.lock:
+        _accounts.flow = None
+        _accounts.message = "Sign-in cancelled"
+    return jsonify({"ok": True})
+
+
+@app.route('/api/accounts/youtube-disconnect', methods=['POST'])
+def api_accounts_youtube_disconnect():
+    try:
+        _accounts.disconnect_youtube()
+        with _liked_lock:
+            _liked_cache.clear()
+        return jsonify({'ok': True})
+    except Exception:
+        return jsonify({'error': 'Could not disconnect YouTube. Please try again.'}), 503
+
+
+@app.route("/api/accounts/signout", methods=["POST"])
+def api_accounts_signout():
+    _accounts.sign_out()
+    return jsonify(_accounts.status())
+
+
+@app.route("/api/accounts/sync", methods=["POST"])
+def api_accounts_sync():
+    _accounts.request_sync()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/accounts/preferences", methods=["POST"])
+def api_accounts_preferences():
+    try:
+        _accounts.set_preferences(request.get_json(silent=True))
+        return jsonify({"ok": True})
+    except ValueError:
+        return jsonify({"error": "Invalid shared preferences"}), 400
+
+
+@app.route("/api/accounts/resolve", methods=["POST"])
+def api_accounts_resolve():
+    from account_local import CloudError
+    try:
+        data = request.get_json(silent=True) or {}
+        _accounts.resolve_conflict(data.get("choice"))
+        return jsonify({"ok": True})
+    except ValueError:
+        return jsonify({"error": "No conflict to resolve or invalid choice"}), 400
+    except (CloudError, requests.RequestException):
+        return jsonify({"error": "Reconnect before resolving this conflict"}), 503
+
+
+try:
+    from account_local import AccountClient
+    from account_library import AccountLibrary
+    _account_library = AccountLibrary(globals(), _account_data_lock)
+    _accounts = AccountClient(resolve_installation_dir(), BASE_DIR, _account_library.collect,
+                              _account_library.apply, data_lock=_account_data_lock, apply_stats=_account_library.apply_stats)
+    _accounts.start_worker()
+    if _accounts.active_user:
+        _account_library.schedule_artwork()
+except Exception:
+    # An account cache/configuration problem must never prevent local playback.
+    log.warning("Account initialization unavailable; local playback remains available")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
