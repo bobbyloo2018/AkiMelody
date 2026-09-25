@@ -7,6 +7,8 @@ wikipedia-api>=0.6.0,<1.0.0
 syncedlyrics>=0.5.0,<1.0.0
 curl_cffi>=0.7.0
 pillow>=10.0.0
+numpy>=1.26.0,<3.0.0
+onnxruntime-directml>=1.18.0
 
 # WebView2 shell (pywebview launcher) + theme detection
 pywebview>=6.0.0

@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -35,6 +37,7 @@ SPEC_DIR = BUILD / "spec"
 WORK_DIR = BUILD / "pyinstaller"
 ACTIVE_BUNDLE_DIR = DIST / "AkiMelody"
 MYAPP_VERSION = "1.0.3"
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FORBIDDEN_BUNDLE_FILES = {
     "cookies.txt",
     "headers.json",
@@ -89,6 +92,34 @@ def prepare_bundle_dir() -> Path:
     return fallback
 
 
+def ensure_ffmpeg_tools() -> None:
+    """Stage the LGPL Windows FFmpeg tools into the bundle inputs."""
+    ffmpeg = ROOT / "build" / "ffmpeg.exe"
+    ffprobe = ROOT / "build" / "ffprobe.exe"
+    if ffmpeg.exists() and ffprobe.exists():
+        return
+    print("[build] FFmpeg tools not found; downloading the Windows essentials bundle...")
+    archive = Path(tempfile.gettempdir()) / f"akimelody-ffmpeg-{os.getpid()}.zip"
+    try:
+        with urllib.request.urlopen(FFMPEG_URL, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        with zipfile.ZipFile(archive) as bundle:
+            members = {Path(name).name.lower(): name for name in bundle.namelist()}
+            for name in ("ffmpeg.exe", "ffprobe.exe"):
+                member = members.get(name)
+                if not member:
+                    raise RuntimeError(f"FFmpeg bundle does not contain {name}")
+                (ROOT / "build" / name).write_bytes(bundle.read(member))
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not obtain FFmpeg for the installer. Download the Windows "
+            "essentials build from https://ffmpeg.org/download.html and place "
+            "ffmpeg.exe and ffprobe.exe in build/."
+        ) from exc
+    finally:
+        archive.unlink(missing_ok=True)
+
+
 def collect_datas():
     """Return a list of (src, dst_folder) tuples for PyInstaller --add-data.
 
@@ -107,6 +138,13 @@ def collect_datas():
     qjs = ROOT / "build" / "qjs.exe"
     if qjs.exists():
         datas.append((str(qjs), "build"))
+    # FFmpeg is optional in source checkouts, but when supplied alongside the
+    # build it is bundled with ffprobe so favorite MP3 downloads work out of
+    # the box in the native installer.
+    ffmpeg = ROOT / "build" / "ffmpeg.exe"
+    ffprobe = ROOT / "build" / "ffprobe.exe"
+    if ffmpeg.exists() and ffprobe.exists():
+        datas.extend([(str(ffmpeg), "build"), (str(ffprobe), "build")])
     # Read-only release notes are displayed by /api/update/changelog. Mutable
     # config/auth files must never be bundled into a public installer.
     changelog = ROOT / "CHANGELOG.md"
@@ -133,6 +171,7 @@ def build_onedir(skip_clean: bool = False) -> int:
         ACTIVE_BUNDLE_DIR = prepare_bundle_dir()
         work_dir = prepare_work_dir()
     SPEC_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_ffmpeg_tools()
 
     datas = collect_datas()
     # PyInstaller --add-data separator is ; on Windows, : on POSIX.

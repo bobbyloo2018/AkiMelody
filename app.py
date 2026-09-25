@@ -64,7 +64,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -777,6 +777,41 @@ def _load_cookies_to_session(session, cookie_text: str):
     for cookie in parse_cookie_rows(cookie_text):
         session.cookies.set(**cookie)
 
+_cookie_header_cache = {}  # (path, mtime_ns, size) -> Cookie header str
+_cookie_header_lock = threading.Lock()
+
+def _cached_cookie_header() -> str:
+    """Memoized Cookie header for googlevideo/upstream requests.
+
+    Pure function of the cookie file bytes (path + mtime + size): avoids a
+    file read plus a full Netscape parse on every stream/probe/proxy call.
+    Returns "" exactly when the uncached path would leave the header unset.
+    """
+    try:
+        cookie_path = _resolve_cookie_file()
+        if not cookie_path:
+            return ""
+        try:
+            st = cookie_path.stat()
+        except OSError:
+            return ""
+        key = (str(cookie_path), st.st_mtime_ns, st.st_size)
+        with _cookie_header_lock:
+            hit = _cookie_header_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            txt = cookie_path.read_text(encoding="utf-8", errors="ignore")
+            hdr = _parse_netscape_cookies(txt, youtube_only=False) or ""
+        except Exception:
+            hdr = ""
+        with _cookie_header_lock:
+            _cookie_header_cache.clear()
+            _cookie_header_cache[key] = hdr
+        return hdr
+    except Exception:
+        return ""
+
 def _generate_auth_headers(cookie_text: str) -> bool:
     """Generate headers.json for ytmusicapi from cookies.txt content.
     The request Cookie header mirrors what a browser sends to music.youtube.com:
@@ -863,10 +898,60 @@ _yt_cookies_ok = _init_yt_cookies()
 
 def _ydl_extras() -> dict:
     """Return cookie/auth extras for yt-dlp options."""
+    extras = {}
     cookie_file = _resolve_cookie_file()
     if cookie_file:
-        return {"cookies": str(cookie_file)}
-    return {}
+        extras["cookies"] = str(cookie_file)
+    ffmpeg_location = _resolve_ffmpeg_location()
+    if ffmpeg_location:
+        extras["ffmpeg_location"] = str(ffmpeg_location)
+    return extras
+
+
+_ffmpeg_location_cache = None
+_ffmpeg_checked = False
+
+
+def _resolve_ffmpeg_location():
+    """Find ffmpeg and ffprobe for yt-dlp post-processing.
+
+    A directory is returned only when both tools are present, which avoids
+    passing yt-dlp a half-configured location and gives it a clear failure
+    message when the optional tools are genuinely unavailable.
+    """
+    global _ffmpeg_location_cache, _ffmpeg_checked
+    if _ffmpeg_checked:
+        return _ffmpeg_location_cache
+    _ffmpeg_checked = True
+    configured = os.environ.get("AKI_FFMPEG_LOCATION", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(Path(os.path.expandvars(os.path.expanduser(configured))))
+    candidates.extend([
+        RESOURCE_DIR / "ffmpeg",
+        RESOURCE_DIR / "ffmpeg.exe",
+        RESOURCE_DIR / "build" / "ffmpeg",
+        RESOURCE_DIR / "build" / "ffmpeg.exe",
+        Path(__file__).resolve().parent / "build" / "ffmpeg",
+        Path(__file__).resolve().parent / "build" / "ffmpeg.exe",
+        BASE_DIR / "ffmpeg",
+        BASE_DIR / "ffmpeg.exe",
+    ])
+    ffmpeg_on_path = shutil.which("ffmpeg")
+    if ffmpeg_on_path:
+        candidates.append(Path(ffmpeg_on_path))
+    for candidate in candidates:
+        directory = candidate if candidate.is_dir() else candidate.parent
+        if (directory / "ffmpeg.exe").is_file() and (directory / "ffprobe.exe").is_file():
+            _ffmpeg_location_cache = directory
+            log.info("FFmpeg post-processing tools found at %s", directory)
+            return directory
+        if (directory / "ffmpeg").is_file() and (directory / "ffprobe").is_file():
+            _ffmpeg_location_cache = directory
+            log.info("FFmpeg post-processing tools found at %s", directory)
+            return directory
+    log.warning("FFmpeg post-processing tools not found; downloads requiring MP3 conversion will fail")
+    return None
 
 def _ydl_js_runtimes() -> dict:
     """Enable yt-dlp JS runtimes for YouTube extraction.
@@ -883,6 +968,9 @@ def _ydl_js_runtimes() -> dict:
              is resolved from sys._MEIPASS — no Node required on user machines.
     """
     runtimes = {}
+    android_qjs = os.environ.get("AKI_ANDROID_QJS", "")
+    if android_qjs and os.path.isfile(android_qjs) and os.access(android_qjs, os.X_OK):
+        return {"quickjs": {"path": android_qjs}}
     # build.py installs QuickJS at <resources>/build/qjs.exe in packaged mode;
     # the same path exists in the source checkout. Older bundles placed it at
     # the resource root, so retain that fallback before checking PATH.
@@ -1203,6 +1291,7 @@ def _save_settings(data: dict):
     _atomic_write_json(SETTINGS_JSON, data)
     _settings_cache = dict(data)
     _settings_cache_ts = time.time()
+
 
 def _fmt_size(b):
     if b < 1024: return f"{b} B"
@@ -1639,6 +1728,34 @@ def itunes_search(query: str, limit: int = 15) -> list:
     except Exception as e:
         log.warning(f"Search Error: {e}")
         return []
+
+def _cached_itunes_search(query: str, limit: int = 15) -> list:
+    """iTunes search behind the shared LRU+TTL search cache.
+
+    Kept as a wrapper (rather than inside itunes_search) so the pure
+    provider function keeps its minimal dependency footprint. Only
+    successful (non-empty) results are cached, so a transient network
+    failure still retries on the next keystroke instead of poisoning
+    the cache for 5 minutes.
+    """
+    if not query.strip():
+        return []
+    key = f"itunes|{query.lower().strip()}|{limit}"
+    now = time.time()
+    with _search_lock:
+        if key in _search_cache:
+            ts, res = _search_cache[key]
+            if now - ts < _SEARCH_TTL:
+                _search_cache.move_to_end(key)
+                return res
+            del _search_cache[key]
+    res = itunes_search(query, limit)
+    if res:
+        with _search_lock:
+            _search_cache[key] = (now, res)
+            if len(_search_cache) > _SEARCH_CACHE_MAX:
+                _search_cache.popitem(last=False)
+    return res
 
 def _record_download_status(tid: str, ok: bool, error: str = None):
     """Record download status with automatic eviction if over limit."""
@@ -3433,6 +3550,8 @@ def api_stream():
     vid = request.args.get("vid", "")
     title = request.args.get("title", "")
     artist = request.args.get("artist", "")
+    if not tid and title and artist:
+        tid = get_track_id(title, artist)
     duration = request.args.get("duration", "")
     album = request.args.get("album", "")
     album_id = request.args.get("album_id", "") or request.args.get("albumId", "")
@@ -3461,7 +3580,7 @@ def api_stream():
             "local": False,
         }), 503
     try:
-        result = _resolve_stream_url(
+        result = resolve_stream_singleflight(
             q, tid, vid, force=force, title=title, artist=artist,
             duration=duration, album=album, album_id=album_id,
         )
@@ -3633,15 +3752,9 @@ def _probe_stream_url(url: str) -> bool:
     # Add YouTube/Google cookies to avoid 403 bot checks on googlevideo
     cookie_hdr = ""
     try:
-        cookie_path = _resolve_cookie_file()
-        if cookie_path:
-            try:
-                txt = cookie_path.read_text(encoding="utf-8", errors="ignore")
-                cookie_hdr = _parse_netscape_cookies(txt, youtube_only=False)
-                if cookie_hdr:
-                    headers["Cookie"] = cookie_hdr
-            except Exception:
-                pass
+        cookie_hdr = _cached_cookie_header()
+        if cookie_hdr:
+            headers["Cookie"] = cookie_hdr
     except Exception:
         pass
     response = None
@@ -3798,16 +3911,10 @@ def api_proxy_stream():
         }
         # Add YouTube/Google cookies to avoid 403 bot checks on googlevideo
         try:
-            cookie_path = _resolve_cookie_file()
-            if cookie_path:
-                try:
-                    txt = cookie_path.read_text(encoding="utf-8", errors="ignore")
-                    # Use YouTube/Google cookies for googlevideo requests
-                    cookie_hdr = _parse_netscape_cookies(txt, youtube_only=False)
-                    if cookie_hdr:
-                        req_headers["Cookie"] = cookie_hdr
-                except Exception:
-                    pass
+            # Use YouTube/Google cookies for googlevideo requests
+            cookie_hdr = _cached_cookie_header()
+            if cookie_hdr:
+                req_headers["Cookie"] = cookie_hdr
         except Exception:
             pass
         range_header = request.headers.get("Range")
@@ -4515,31 +4622,52 @@ def _scan_playlists():
             if not audio_files and not valid_meta and "accountItems" not in account_meta:
                 continue
             count = len(account_meta["accountItems"]) if "accountItems" in account_meta else len(audio_tids | set(valid_meta))
-            playlist_meta = _read_playlist_json(entry / "playlist.json", "playlist metadata")
+            # playlist.json was already read above as account_meta — reuse it.
+            playlist_meta = account_meta
             album_meta = _read_playlist_json(entry / "album.json", "album metadata")
             cover_art = ""
             local_cover = entry / "cover.jpg"
             try:
-                if local_cover.exists() and local_cover.stat().st_size > 100:
-                    cover_art = f"/api/library_file?q={urllib.parse.quote(entry.name)}/cover.jpg&cv=2&v={local_cover.stat().st_mtime_ns}"
+                cover_stat = local_cover.stat()
+                if cover_stat.st_size > 100:
+                    cover_art = f"/api/library_file?q={urllib.parse.quote(entry.name)}/cover.jpg&cv=2&v={cover_stat.st_mtime_ns}"
             except OSError:
                 pass
             if not cover_art:
                 cover_art = str(album_meta.get("art") or "")
             if not cover_art:
-                ordered_meta = []
+                # Prefer the already-parsed valid_meta dict over re-reading
+                # every meta file from disk a second time (same order as
+                # before: audio tids first, then remaining meta files).
+                seen_cover_tids = set()
                 for audio in audio_files:
-                    ordered_meta.append(entry / f"{_tid_from_audio_filename(audio)}.meta.json")
-                ordered_meta.extend(meta_files)
-                seen = set()
-                for meta_path in ordered_meta:
-                    if meta_path in seen or not meta_path.exists():
+                    tid = _tid_from_audio_filename(audio)
+                    if tid in seen_cover_tids:
                         continue
-                    seen.add(meta_path)
-                    tid = meta_path.name[:-len(".meta.json")]
-                    cover_art = _read_track_meta(meta_path, tid).get("art", "")
+                    seen_cover_tids.add(tid)
+                    meta = valid_meta.get(tid)
+                    if meta is None:
+                        meta_path = entry / f"{tid}.meta.json"
+                        if not meta_path.exists():
+                            continue
+                        meta = _read_track_meta(meta_path, tid) or {}
+                    cover_art = meta.get("art", "")
                     if cover_art:
                         break
+                if not cover_art:
+                    for meta_path in meta_files:
+                        tid = meta_path.name[:-len(".meta.json")]
+                        if tid in seen_cover_tids:
+                            continue
+                        seen_cover_tids.add(tid)
+                        meta = valid_meta.get(tid)
+                        if meta is None:
+                            if not meta_path.exists():
+                                continue
+                            meta = _read_track_meta(meta_path, tid) or {}
+                        cover_art = meta.get("art", "")
+                        if cover_art:
+                            break
             pending_count = sum(
                 1 for tid, meta in valid_meta.items()
                 if tid not in audio_tids and meta.get("downloadState") == "pending"
@@ -5673,6 +5801,7 @@ def api_toggle_community_showcase():
     _save_settings(settings)
     return jsonify(settings)
 
+
 @app.route("/api/youtube/refresh_auth", methods=["POST"])
 def api_refresh_youtube_auth():
     """Re-read cookies.txt and rebuild YTMusic auth headers. Called after Tauri login."""
@@ -6243,14 +6372,14 @@ def api_search():
     if filter_type == "all":
         # Itunes search already returns high-res artwork; standardize so the
         # frontend gets uniform schema keys (name, artist, tid, dur, etc.)
-        results = itunes_search(q, limit=15)
+        results = _cached_itunes_search(q, limit=15)
         return jsonify([standardize_track(dict(t)) for t in results])
 
     if filter_type in ("track", "album", "artist"):
         results = yt_music_search_filtered(q, filter_type)
     else:
         # Unknown filter string: graceful fallback, treat as itunes "all".
-        results = itunes_search(q, limit=15)
+        results = _cached_itunes_search(q, limit=15)
         return jsonify([standardize_track(dict(t)) for t in results])
 
     if filter_type == "track":
@@ -6262,6 +6391,98 @@ def api_search():
     # Album / Artist path: bypass the cover enhancer (shape mismatch).
     # Return as-is from yt-music; consumer renders browseId for navigation.
     return jsonify(results)
+
+
+_charts_cache = {"ts": 0.0, "payload": None}
+_charts_lock = threading.Lock()
+_CHARTS_TTL = 3600  # global charts rotate daily; hourly refresh is plenty
+
+
+def _charts_artwork(images) -> str:
+    """Largest RSS artwork, upsized the same way itunes_search does."""
+    best = ""
+    for im in images or []:
+        u = (im or {}).get("label", "")
+        if u:
+            best = u
+    if not best:
+        return ""
+    return re.sub(r"\d+x\d+bb", "600x600bb", best)
+
+
+@app.route("/api/charts")
+def api_charts():
+    """US Top 10 songs + albums from the public iTunes RSS charts.
+
+    Songs are enriched with durations via one batched Lookup call so they
+    arrive Track-shaped (name, artist, art, dur, tid) and play exactly like
+    filter=all results through the existing recording-resolution path.
+    Albums carry provider art/year; they open as explorable focus cards.
+    Cached for an hour; partial results survive a single-feed failure.
+    """
+    now = time.time()
+    with _charts_lock:
+        if _charts_cache["payload"] is not None and now - _charts_cache["ts"] < _CHARTS_TTL:
+            return jsonify(_charts_cache["payload"])
+    payload = {"songs": [], "albums": []}
+    try:
+        entries = _itunes_session.get(
+            "https://itunes.apple.com/us/rss/topsongs/limit=10/json", timeout=10
+        ).json().get("feed", {}).get("entry", [])
+        ids = []
+        for e in entries:
+            imid = ((e.get("id") or {}).get("attributes") or {}).get("im:id", "")
+            if imid:
+                ids.append(imid)
+        lookup = {}
+        if ids:
+            for r in _itunes_session.get(
+                "https://itunes.apple.com/lookup",
+                params={"id": ",".join(ids[:10]), "entity": "song", "country": "US"},
+                timeout=10,
+            ).json().get("results", []):
+                lookup[str(r.get("trackId", ""))] = r
+        for e in entries:
+            imid = ((e.get("id") or {}).get("attributes") or {}).get("im:id", "")
+            name = ((e.get("im:name") or {}).get("label") or "").strip()
+            artist = ((e.get("im:artist") or {}).get("label") or "").strip()
+            if not name:
+                continue
+            lk = lookup.get(imid, {})
+            art = (lk.get("artworkUrl100") or "").replace("100x100bb.jpg", "600x600bb.jpg")
+            art = art or _charts_artwork(e.get("im:image"))
+            ms = lk.get("trackTimeMillis") or 0
+            artist = artist or "Unknown Artist"
+            payload["songs"].append({
+                "name": name, "artist": artist, "art": art,
+                "dur": int(ms / 1000) if ms else 0,
+                "tid": get_track_id(name, artist), "source": "charts",
+            })
+    except Exception as e:
+        log.warning(f"Charts songs failed: {e}")
+    try:
+        entries = _itunes_session.get(
+            "https://itunes.apple.com/us/rss/topalbums/limit=10/json", timeout=10
+        ).json().get("feed", {}).get("entry", [])
+        for e in entries[:8]:
+            name = ((e.get("im:name") or {}).get("label") or "").strip()
+            artist = ((e.get("im:artist") or {}).get("label") or "").strip()
+            if not name:
+                continue
+            rel = (e.get("im:releaseDate") or {}).get("label", "") or ""
+            year = rel[:4] if rel[:4].isdigit() else ""
+            payload["albums"].append({
+                "name": name, "artist": artist or "Unknown Artist",
+                "art": _charts_artwork(e.get("im:image")), "year": year,
+                "source": "charts",
+            })
+    except Exception as e:
+        log.warning(f"Charts albums failed: {e}")
+    if payload["songs"] or payload["albums"]:
+        with _charts_lock:
+            _charts_cache["ts"] = time.time()
+            _charts_cache["payload"] = payload
+    return jsonify(payload)
 
 
 @app.route("/api/radio/suggest")
@@ -7019,6 +7240,66 @@ def _save_community_cache(data: dict):
     _community_cache = dict(data)
     _community_cache_ts = time.time()
 
+# ── Community Discover background warmup ────────────────────────────────
+# A cold /api/community/discover costs ~10-20s of artwork lookups and runs
+# on the first Discover visit of each hour (hourly-seeded sample). This
+# daemon precomputes it once after boot settles, then re-warms shortly
+# after each hour boundary, so visits served from the 1h cache (~2ms).
+# Best-effort only: every failure mode is swallowed, favorites-absent
+# instances do no work, and nothing starts unless a server entry point
+# calls maybe_start_community_warmup() (importing app never spawns threads,
+# so unit tests are unaffected).
+_community_warmup_started = False
+_community_warmup_lock = threading.Lock()
+_community_warmup_inflight = False
+
+def _community_warm_once():
+    """Run one discover computation to populate the cache. Never raises."""
+    global _community_warmup_inflight
+    if _community_warmup_inflight:
+        return
+    _community_warmup_inflight = True
+    try:
+        try:
+            favs = _load_favorites()
+        except Exception:
+            favs = []
+        if not favs:
+            return
+        # Route has no query params; request context is only needed for jsonify.
+        with app.test_request_context():
+            api_community_discover()
+    except Exception as e:
+        log.debug(f"Community warmup skipped: {e}")
+    finally:
+        _community_warmup_inflight = False
+
+def _community_warmup_loop():
+    # Let auth, first paint, and first playback win the boot CPU (yt-dlp
+    # extraction is CPU-heavy); Discover can wait under a minute.
+    time.sleep(45)
+    _community_warm_once()
+    while True:
+        # Wake ~2min past the next hour boundary (new seed → new sample),
+        # plus jitter so fleets don't thunder.
+        now = time.time()
+        nxt = (int(now // 3600) + 1) * 3600 + 120 + random.uniform(0, 60)
+        time.sleep(max(60.0, nxt - now))
+        _community_warm_once()
+
+def maybe_start_community_warmup():
+    """Idempotent; call once from each server entry point after startup."""
+    global _community_warmup_started
+    with _community_warmup_lock:
+        if _community_warmup_started:
+            return
+        _community_warmup_started = True
+    threading.Thread(
+        target=_community_warmup_loop,
+        name="aki-community-warm",
+        daemon=True,
+    ).start()
+
 def _load_pinned_art() -> list:
     global _pinned_art_cache, _pinned_art_cache_ts
     now = time.time()
@@ -7315,7 +7596,7 @@ def _classify_layout_type(image_data: dict) -> str:
     return "square"
 
 
-def _discover_art_for_item(artist: str, song: str = "", fav: dict = None) -> list:
+def _discover_art_for_item(artist: str, song: str = "", fav: dict = None, _artist_memo: dict = None) -> list:
     """Strict 3-stage fallback pipeline — always returns ≥1 valid image.
 
     Stage 1 (Track Search): MusicBrainz/Cover Art Archive for the specific song.
@@ -7324,6 +7605,10 @@ def _discover_art_for_item(artist: str, song: str = "", fav: dict = None) -> lis
 
     Returns list of dicts: {url, artist, song, asset_id, layout_type, source}.
     Guaranteed non-empty — Stage 3 ensures every track gets at least one image.
+
+    _artist_memo optionally dedupes the artist-scoped Stage 2 network calls
+    across items sharing an artist within one request (pure function of the
+    artist name, so shared results are identical).
     """
     fav = fav or {}
     seen_asset_ids = set()
@@ -7388,10 +7673,22 @@ def _discover_art_for_item(artist: str, song: str = "", fav: dict = None) -> lis
     # ════════════════════════════════════════════════════════════════════════
     artist_headers = []
     if artist:
-        artist_headers = _fetch_ytmusic_artist_header(artist)
+        _memo_key = ("header", artist.lower().strip())
+        if _artist_memo is not None and _memo_key in _artist_memo:
+            artist_headers = _artist_memo[_memo_key]
+        else:
+            artist_headers = _fetch_ytmusic_artist_header(artist)
+            if _artist_memo is not None:
+                _artist_memo[_memo_key] = artist_headers
 
     if not artist_headers and artist:
-        artist_headers = _fetch_artist_portrait(artist)
+        _memo_key = ("portrait", artist.lower().strip())
+        if _artist_memo is not None and _memo_key in _artist_memo:
+            artist_headers = _artist_memo[_memo_key]
+        else:
+            artist_headers = _fetch_artist_portrait(artist)
+            if _artist_memo is not None:
+                _artist_memo[_memo_key] = artist_headers
 
     if artist_headers:
         results = []
@@ -7528,9 +7825,17 @@ def api_community_discover():
         if not unique_items:
             return jsonify({"images": [], "source": "none"})
 
-        # Random sample up to 6 entries for visual variety
+        # Sample up to 6 entries for visual variety. The sample is seeded by
+        # the hour plus the library fingerprint (dedicated Random instance, so
+        # global random state is untouched): the same 6 items are picked all
+        # hour, which lets the 1h community cache below actually hit instead of
+        # recomputing ~10s of artwork lookups on every Discover visit.
         sample_count = min(6, len(unique_items))
-        items = random.sample(unique_items, sample_count)
+        seed_src = str(int(time.time() // 3600)) + "|" + "|".join(sorted(
+            f"{i.get('artist','')}||{i.get('name','')}" for i in unique_items
+        ))
+        items = random.Random(int(hashlib.md5(seed_src.encode()).hexdigest()[:16], 16)).sample(
+            unique_items, sample_count)
 
         # Check cache (keyed by sorted artist+song keys)
         cache_key = "|".join(sorted(
@@ -7555,10 +7860,13 @@ def api_community_discover():
             artist = (fav_obj.get("artist") or "").strip()
             song = (fav_obj.get("name") or "").strip()
             try:
-                return _discover_art_for_item(artist, song, fav=fav_obj)
+                return _discover_art_for_item(artist, song, fav=fav_obj, _artist_memo=_discover_memo)
             except Exception as e:
                 log.debug(f"Community discover failed for {artist}: {e}")
             return []
+
+        _discover_memo = {}
+        futures = [_io_executor.submit(_lookup_one, item) for item in items]
 
         futures = [_io_executor.submit(_lookup_one, item) for item in items]
         for fut in futures:
@@ -8760,8 +9068,6 @@ def api_accounts_signin():
     from account_local import CloudError, CredentialUnavailable
     try:
         data = request.get_json(silent=True) or {}
-        if IS_ANDROID:
-            return jsonify({"error": "Desktop accounts are available on Windows first"}), 409
         url = _accounts.start_login(import_local=data.get("importLocal") is True, youtube=data.get('youtube') is True)
         _accounts.wake.set()
         return jsonify({"authorizationUrl": url})
@@ -8840,4 +9146,5 @@ except Exception:
 if __name__ == "__main__":
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     print(f"[AkiMelody] server listening on http://{SERVER_BIND_HOST}:{SERVER_PORT}", flush=True)
+    maybe_start_community_warmup()
     app.run(host=SERVER_BIND_HOST, port=SERVER_PORT, debug=False, use_reloader=False)
