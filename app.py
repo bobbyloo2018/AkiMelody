@@ -3,6 +3,7 @@ AkiMelody (秋メロディ) — Flask Backend
 """
 
 from flask import g, Flask, render_template, request, jsonify, send_from_directory, Response, redirect as _flask_redirect
+from mv_media_cache import VideoMediaCache
 import uuid
 import requests
 try:
@@ -25,6 +26,8 @@ import struct
 import hashlib
 import random
 import shutil
+import queue
+import subprocess
 import tempfile
 import logging
 import unicodedata
@@ -64,7 +67,7 @@ log = logging.getLogger("akimelody")
 # ── Application version (SemVer) ──────────────────────────────────────────────
 # Surfaced via /api/settings and used by the automatic background updater to
 # compare against the latest GitHub release tag. Bump this on every release.
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.3"
 
 # GitHub repository for release checks (owner/repo shape). Override by setting
 # AKI_UPDATE_REPO in the environment. Must match the repo that PostUpdate.bat
@@ -116,6 +119,7 @@ RESOURCE_DIR = DATA_PATHS.resources
 # BASE_DIR remains as a compatibility alias for code that reports paths
 # relative to the mutable data root.
 BASE_DIR = DATA_PATHS.root
+_mv_media_cache = VideoMediaCache(BASE_DIR / 'CACHE' / 'music_videos')
 app = Flask(
     __name__,
     template_folder=str(RESOURCE_DIR / "templates"),
@@ -236,8 +240,20 @@ def _protect_local_service():
 @app.after_request
 def _no_store_word_sync(resp):
     # The Word Sync addon/fetcher are under active development; never let a
-    # persistent browser/WebView2 cache serve stale copies.
+    # persistent browser/WebView2 cache serve stale copies. The same applies
+    # to the HTML app shells and first-party UI bundles: Android keeps the
+    # WebView HTTP cache across `adb install -r` updates, so without no-store
+    # here a fresh APK would keep rendering the previous UI (and old JS).
+    # Immutable third-party assets (fonts, fontawesome) and media routes keep
+    # their own cache headers and are deliberately not matched below.
     if request.path.startswith(("/static/js/word-", "/api/accounts/")):
+        resp.headers["Cache-Control"] = "no-store"
+    if request.path == "/" or request.path.startswith("/mobile"):
+        resp.headers["Cache-Control"] = "no-store"
+    if request.path.startswith((
+        "/static/js/mobile", "/static/js/native_playback",
+        "/static/css/mobile",
+    )):
         resp.headers["Cache-Control"] = "no-store"
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -274,11 +290,54 @@ _recording_resolution_lock = threading.RLock()
 _recording_resolution_inflight = {}
 _recording_prefetch_pending = set()
 
+# Official music-video (HD video) resolutions. The MV videoId is a *different*
+# YouTube video from the audio upload the recording resolver picks, so it gets
+# its own stable cache: positive entries live as long as recording resolutions;
+# "no official MV" negatives expire after 7 days like the lyrics negative cache
+# so tracks from obscure artists are periodically re-checked.
+MV_RESOLUTIONS_JSON = BASE_DIR / "mv_resolutions.json"
+_MV_RESOLUTION_SCHEMA = 1
+# Resolver generation: bump when MV resolution LOGIC changes (gates, scoring,
+# tiering). Entries stamped with an older generation are discarded on load —
+# this is the only safe invalidation mechanism because the app caches
+# resolutions in memory: disk scrubs made while the app runs are silently
+# overwritten by the next save (real case: 'Loser' — a scrubbed wrong pick
+# resurrected from the running app's memory 20h later).
+_MV_RESOLVER_VERSION = 3
+_MV_RESOLUTION_TTL = 45 * 24 * 60 * 60
+_MV_RESOLUTION_NEG_TTL = 7 * 24 * 60 * 60
+_MV_RESOLUTION_MAX = 2500
+_mv_resolution_cache = None
+_mv_resolution_lock = threading.RLock()
+_mv_resolution_inflight = {}
+_mv_prefetch_pending = set()
+# Artist-channel browseIds used to verify MV uploaders. In-memory only: one
+# artist search per unique artist per process lifetime is acceptable.
+_mv_artist_channels_cache = OrderedDict()
+_MV_ARTIST_CHANNELS_MAX = 200
+_MV_ARTIST_CHANNELS_TTL = 30 * 24 * 60 * 60
+
+# MV video stream URLs live in the same LRU + proxy as audio under a
+# namespaced key ("mv:{tid}:{cap}") so the two transports for one track never
+# clobber each other (the proxy is 1 key -> 1 URL). Video resolution keeps its
+# own single-flight coordination dict: a video extraction can never delay or
+# join an audio resolution.
+_MV_STREAM_KEY_PREFIX = "mv:"
+_MV_ALLOWED_HEIGHTS = (2160, 1440, 1080, 720)
+_MV_DEFAULT_MAX_HEIGHT = 1080
+_mv_stream_resolution_lock = threading.Lock()
+_mv_stream_resolution_inflight = {}
+
 def _invalidate_stream_cache():
     """Clear all yt-dlp stream URLs from the cache. Called after cookie refresh,
     since URLs cached before auth rotation are likely all 401-expired."""
     with _stream_cache_lock:
         _stream_cache.clear()
+    try:
+        if _STREAM_CACHE_JSON.exists():
+            _STREAM_CACHE_JSON.unlink()
+    except Exception:
+        pass
 
 def _extract_url_expiry(url: str) -> float:
     """Parse the `expire=<unix_secs>` query param from a googlevideo URL.
@@ -298,12 +357,77 @@ def _cache_stream(tid: str, url: str, identity: str = "", metadata: dict | None 
     with _stream_cache_lock:
         entry = {"url": url, "exp": _extract_url_expiry(url), "identity": identity}
         if metadata:
-            for key in ("matchedVideoId", "matchConfidence", "recordingResolved"):
+            for key in ("matchedVideoId", "matchConfidence", "recordingResolved", "maxHeight"):
                 if metadata.get(key) is not None:
                     entry[key] = metadata[key]
         _stream_cache[tid] = entry
         if len(_stream_cache) > _STREAM_CACHE_MAX:
             _stream_cache.popitem(last=False)
+        _save_stream_cache_locked()
+
+_STREAM_CACHE_JSON = BASE_DIR / "stream_cache.json"
+_STREAM_CACHE_LOAD_MARGIN = 300.0  # only reload URLs valid for 5+ more minutes
+
+
+def _save_stream_cache_locked() -> None:
+    """Best-effort disk mirror of the in-memory stream cache (call with lock held).
+
+    Replays after a process restart — routine on Android — otherwise lose every
+    cached googlevideo URL and pay a full extraction per tap. Only entries with
+    a comfortably-future `expire=` survive; the proxy still evicts anything
+    YouTube rejects, so a stale disk entry costs one 502, never a loop."""
+    try:
+        now = time.time()
+        entries = {}
+        for tid, cached in _stream_cache.items():
+            entry = cached if isinstance(cached, dict) else {"url": cached}
+            exp = entry.get("exp") or 0
+            url = entry.get("url") or ""
+            if not url or not exp or exp - now <= _STREAM_CACHE_LOAD_MARGIN:
+                continue
+            saved = {"url": url, "exp": exp, "identity": entry.get("identity") or ""}
+            for key in ("matchedVideoId", "matchConfidence", "recordingResolved", "maxHeight"):
+                if entry.get(key) is not None:
+                    saved[key] = entry[key]
+            entries[str(tid)] = saved
+        _atomic_write_json(_STREAM_CACHE_JSON, {"entries": entries})
+    except Exception as exc:
+        log.debug("Stream cache could not be saved: %s", exc)
+
+
+def _load_stream_cache_locked() -> None:
+    """Reload still-valid stream URLs saved by a previous process lifetime."""
+    try:
+        if not _STREAM_CACHE_JSON.exists():
+            return
+        doc = json.loads(_STREAM_CACHE_JSON.read_text(encoding="utf-8"))
+        now = time.time()
+        restored = 0
+        for tid, entry in (doc.get("entries") or {}).items():
+            if not isinstance(entry, dict) or not entry.get("url"):
+                continue
+            exp = entry.get("exp") or 0
+            if not exp or exp - now <= _STREAM_CACHE_LOAD_MARGIN:
+                continue
+            saved = {"url": entry["url"], "exp": exp, "identity": entry.get("identity") or ""}
+            for key in ("matchedVideoId", "matchConfidence", "recordingResolved", "maxHeight"):
+                if entry.get(key) is not None:
+                    saved[key] = entry[key]
+            _stream_cache[str(tid)] = saved
+            restored += 1
+        while len(_stream_cache) > _STREAM_CACHE_MAX:
+            _stream_cache.popitem(last=False)
+        if restored:
+            log.info("Restored %d stream URLs from disk cache", restored)
+    except Exception as exc:
+        log.debug("Stream cache could not be loaded: %s", exc)
+
+
+try:
+    with _stream_cache_lock:
+        _load_stream_cache_locked()
+except Exception:
+    pass
 
 def has_valid_auth_state() -> bool:
     """Single source of truth for 'do we have a usable YouTube auth state right now?'.
@@ -324,6 +448,7 @@ _ARTWORK_JOBS_MAX = 100
 
 _playlist_index_cache = None   # cached list from api_playlists
 _playlist_index_lock = threading.Lock()
+_playlist_scan_lock = threading.Lock()
 _playlist_index_generation = 0
 _playlist_catalog_lock = threading.RLock()
 _playlist_locks_guard = threading.Lock()
@@ -1162,27 +1287,6 @@ def _local_media_payload(tid: str, index=None) -> dict:
         payload["format"] = audio.suffix.lower().lstrip(".")
     return payload
 
-# ── Community discover cache ──────────────────────────────────────────────────
-COMMUNITY_CACHE_JSON = SAVED_DIR / "community_cache.json"
-_community_cache = None
-_community_cache_ts = 0.0
-_COMMUNITY_CACHE_TTL = 3600  # 1 hour
-_community_cache_lock = threading.Lock()
-
-# ── Community pinned art flat-file DB ────────────────────────────────────────
-PINNED_ART_JSON = SAVED_DIR / "pinned_art.json"
-_pinned_art_cache = None
-_pinned_art_cache_ts = 0.0
-_PINNED_ART_CACHE_TTL = 5.0
-_pinned_art_lock = threading.Lock()
-
-# ── MusicBrainz session ──────────────────────────────────────────────────────
-_musicbrainz_session = requests.Session()
-_musicbrainz_session.headers.update({
-    "User-Agent": "AkiMelody/1.0 (https://github.com/akimelody; akimelody@example.com)",
-    "Accept": "application/json",
-})
-
 # Persistent fallback for /api/proxy_stream when curl_cffi is unavailable.
 # One session means we reuse TCP + TLS handshakes across all track plays instead of
 # opening a fresh connection per /api/proxy_stream call.
@@ -1258,6 +1362,57 @@ def _ytmusic_player_audio_url(video_id: str) -> str:
         return ""
 
 
+def _ytmusic_player_video_url(video_id: str, max_height: int = 1080) -> tuple[str, int]:
+    """Return the best direct video URL from the YTMusic player payload.
+
+    Sibling of _ytmusic_player_audio_url: the same get_song call the audio
+    fast path makes, reading the video itags that function filters out — no
+    extra network when audio already resolved through this payload. Returns
+    (url, height); ("", 0) when no direct video format is exposed. Audio
+    formats are never selected: the <video> element is muted and slaved to the
+    audio pipeline, so combined formats waste bandwidth by definition.
+
+    Picker: closest rung at or below max_height wins (bandwidth); if every
+    rung sits above the cap the smallest is taken (still playable, least
+    waste above cap). At equal height WebM is preferred over MP4: YouTube's
+    MP4 video itags are fragmented DASH (ftypdash/moof) which a plain
+    <video src> cannot progressively play, while WebM/VP9 is streamable."""
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        return "", 0
+    try:
+        payload = ytmusic.get_song(video_id) or {}
+        status = (payload.get("playabilityStatus") or {}).get("status")
+        if status and status != "OK":
+            return "", 0
+        streaming = payload.get("streamingData") or {}
+        formats = list(streaming.get("adaptiveFormats") or []) + list(streaming.get("formats") or [])
+        candidates = []
+        for item in formats:
+            mime = str(item.get("mimeType") or "").lower()
+            url = str(item.get("url") or "")
+            if not url.startswith("https://") or not mime.startswith("video/"):
+                continue
+            try:
+                height = int(item.get("height") or 0)
+            except (TypeError, ValueError):
+                continue
+            if height <= 0:
+                continue
+            candidates.append((height, int(item.get("bitrate") or 0), url, mime))
+        if not candidates:
+            return "", 0
+        within = [c for c in candidates if c[0] <= max_height]
+        if within:
+            best = max(within, key=lambda c: (c[0], 1 if "webm" in c[3] else 0, c[1]))
+        else:
+            best = min(candidates, key=lambda c: (c[0], 0 if "webm" in c[3] else 1, c[1]))
+        return best[2], best[0]
+    except Exception as exc:
+        log.debug("YTMusic direct player video unavailable for %s: %s", video_id, exc)
+        return "", 0
+
+
 def _has_youtube_oauth_state() -> bool:
     try:
         return _yt_oauth_file.is_file() and _yt_oauth_file.stat().st_size > 20 and bool(_load_youtube_oauth_credentials())
@@ -1275,19 +1430,22 @@ def _load_settings() -> dict:
     now = time.time()
     if _settings_cache is not None and (now - _settings_cache_ts) < _SETTINGS_CACHE_TTL:
         return dict(_settings_cache)
-    defaults = {"ui_layout_mode": "card", "cache_limit_gb": 5, "community_showcase_enabled": True}
+    defaults = {"ui_layout_mode": "card", "cache_limit_gb": 5}
     if SETTINGS_JSON.exists():
         try:
             data = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
             defaults.update(data)
         except Exception:
             pass
+    defaults.pop("community_showcase_enabled", None)
     _settings_cache = dict(defaults)
     _settings_cache_ts = now
     return _settings_cache
 
 def _save_settings(data: dict):
     global _settings_cache, _settings_cache_ts
+    data = dict(data)
+    data.pop("community_showcase_enabled", None)
     _atomic_write_json(SETTINGS_JSON, data)
     _settings_cache = dict(data)
     _settings_cache_ts = time.time()
@@ -2095,17 +2253,61 @@ def get_stream_url(query: str, tid: str = "", vid: str = "", force: bool = False
     _YDL_HTTP_HEADERS = {"User-Agent": _YDL_USER_AGENT}
 
     def _extract_url_for_vid(target_vid: str) -> tuple[str | None, bool]:
-        """Extract stream URL for a specific videoId. Returns (url, auth_fail_seen)."""
+        """Extract stream URL for a specific videoId. Returns (url, auth_fail_seen).
+
+        Single yt-dlp extraction with the default client rotation. The picker
+        accepts real audio streams only: storyboard/thumbnail/manifest
+        placeholders must never be served as playable audio (a pinned single
+        client can return placeholder-only format tables, which the old loose
+        `vcodec == "none"` filter accepted as hits).
+        """
         source = f"https://www.youtube.com/watch?v={target_vid}"
 
         # Fast path: YTMusic direct player URL (try ALWAYS, even on force)
-        # force=True only bypasses cache, not the extraction method order
+        # force=True only bypasses cache, not the extraction method order.
+        # Probe-gated: get_song's WEB_REMIX-signed URLs are dead-on-arrival
+        # for a subset of videos (403 to every header set we use — proven
+        # live for both audio and video itags). Serving one meant a proxy
+        # 403 + client error-retry + full re-extraction on cold plays that
+        # should have gone straight to yt-dlp.
         try:
             direct_url = _ytmusic_player_audio_url(target_vid)
-        except NameError:
+            if direct_url and not _probe_stream_url(direct_url):
+                direct_url = ""
+        except Exception:
             direct_url = ""
         if direct_url:
             return direct_url, False
+
+        def _is_placeholder_format(f):
+            fid = str(f.get("format_id") or "").lower()
+            proto = str(f.get("protocol") or "").lower()
+            if "storyboard" in fid or "thumbnail" in fid or fid.startswith("sb"):
+                return True
+            if proto == "mhtml" or "m3u8" in proto or "mpd" in proto:
+                return True
+            return str(f.get("ext") or "").lower() == "mhtml"
+
+        def _pick_best_audio_url(info):
+            if "entries" in info:
+                entries = [e for e in info["entries"] if e]
+                if not entries:
+                    return None
+                info = entries[0]
+            formats = [f for f in (info.get("formats", []) or []) if isinstance(f, dict) and f.get("url")]
+            if not formats:
+                return info.get("url")
+            strict = [f for f in formats
+                      if (f.get("vcodec") or "") == "none"
+                      and (f.get("acodec") or "none") != "none"
+                      and not _is_placeholder_format(f)]
+            pool = strict or [f for f in formats
+                              if (f.get("vcodec") or "") == "none"
+                              and not _is_placeholder_format(f)]
+            if not pool:
+                return None
+            best = max(pool, key=lambda f: ({"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))
+            return best["url"]
 
         # Single yt-dlp extraction - gets complete formats table in one pass
         fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
@@ -2116,21 +2318,15 @@ def get_stream_url(query: str, tid: str = "", vid: str = "", force: bool = False
             **_ydl_extras(),
         }
         try:
+            started = time.perf_counter()
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source, download=False)
-                if "entries" in info:
-                    entries = [e for e in info["entries"] if e]
-                    if not entries:
-                        return None, False
-                    info = entries[0]
-                formats = info.get("formats", [])
-                audio = [f for f in formats if f.get("vcodec") == "none" and f.get("url")]
-                if not audio:
-                    audio = [f for f in formats if f.get("url")]
-                if not audio:
-                    return info.get("url"), False
-                best = max(audio, key=lambda f: ({"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))
-                return best["url"], False
+                best_url = _pick_best_audio_url(ydl.extract_info(source, download=False))
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if best_url:
+                print(f"[STREAM_URL] vid={target_vid} extract {elapsed_ms:.0f}ms HIT", flush=True)
+                return best_url, False
+            print(f"[STREAM_URL] vid={target_vid} extract {elapsed_ms:.0f}ms MISS", flush=True)
+            return None, False
         except Exception as e:
             msg = str(e)
             auth_fail_seen = bool(_AUTH_FAIL_RE.search(msg))
@@ -2278,6 +2474,252 @@ def resolve_stream_singleflight(query: str, tid: str = "", vid: str = "", force:
             if _stream_resolution_inflight.get(key) is entry:
                 _stream_resolution_inflight.pop(key, None)
             entry["event"].set()
+
+# ── Official music-video (HD) stream resolution ──────────────────────────────
+#
+# Second expensive-resolution boundary, deliberately separate from the audio
+# single-flight above: a video extraction can never delay audio startup, and
+# audio joiners never wait behind video work. Resolved URLs are cached under
+# "mv:{tid}:{cap}" in the shared _stream_cache LRU + disk mirror, so the
+# Range-capable /api/proxy_stream serves them unchanged and inherits stale-
+# eviction, cookie-refresh invalidation and restart persistence for free.
+#
+# Audio master / video slave: the browser <video> is muted and slaved to the
+# audio pipeline, so ONLY video formats are selected — `+bestaudio` merges are
+# never requested (yt-dlp merging is also CPU/battery-hostile).
+
+
+def _mv_stream_cache_key(tid: str, max_height: int) -> str:
+    return f"{_MV_STREAM_KEY_PREFIX}{tid}:{max_height}"
+
+
+def _extract_mv_url_for_vid(video_id: str, max_height: int) -> tuple[str | None, int, bool]:
+    """Single yt-dlp extraction for the MV's video stream.
+
+    Returns (url, height, auth_fail_seen). The format ladder requests
+    WebM (VP9) video-only itags first — YouTube's MP4 video itags are
+    fragmented DASH which a plain <video src> cannot progressively play,
+    while WebM streams natively. `+bestaudio` merges are never requested:
+    the <video> is muted and slaved to the audio pipeline, so merged audio
+    is pure CPU/battery waste."""
+    source = f"https://www.youtube.com/watch?v={video_id}"
+    fmt = (
+        f"bestvideo[height<={max_height}][acodec=none][ext=webm]"
+        f"/bestvideo[height<={max_height}][acodec=none]"
+        "/bestvideo[acodec=none][ext=webm]"
+        "/bestvideo[acodec=none]"
+        f"/best[vcodec!=none][acodec!=none][height<={max_height}][ext=webm]"
+        f"/best[vcodec!=none][acodec!=none][height<={max_height}]"
+        "/best[vcodec!=none]"
+    )
+    ydl_opts = {
+        "format": fmt,
+        **_YDL_EXTRACT_OPTS,
+        "http_headers": {"User-Agent": _YDL_USER_AGENT},
+        **_ydl_extras(),
+    }
+
+    def _is_placeholder_format(f):
+        fid = str(f.get("format_id") or "").lower()
+        proto = str(f.get("protocol") or "").lower()
+        if "storyboard" in fid or "thumbnail" in fid or fid.startswith("sb"):
+            return True
+        if proto == "mhtml" or "m3u8" in proto or "mpd" in proto:
+            return True
+        return str(f.get("ext") or "").lower() == "mhtml"
+
+    def _pick_best_video_url(info):
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                return None
+            info = entries[0]
+        formats = [f for f in (info.get("formats", []) or []) if isinstance(f, dict) and f.get("url")]
+        if not formats:
+            return None
+        strict = [f for f in formats
+                  if (f.get("vcodec") or "") != "none"
+                  and not _is_placeholder_format(f)
+                  and int(f.get("height") or 0) > 0]
+        if not strict:
+            return None
+        within = [f for f in strict if int(f.get("height") or 0) <= max_height]
+        if within:
+            best = max(within, key=lambda f: (
+                int(f.get("height") or 0),
+                1 if str(f.get("ext") or "").lower() == "webm" else 0,
+                f.get("tbr") or 0,
+            ))
+        else:
+            best = min(strict, key=lambda f: (
+                int(f.get("height") or 0),
+                0 if str(f.get("ext") or "").lower() == "webm" else 1,
+                -(f.get("tbr") or 0),
+            ))
+        return best.get("url"), int(best.get("height") or 0)
+
+    try:
+        started = time.perf_counter()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            picked = _pick_best_video_url(ydl.extract_info(source, download=False))
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if picked:
+            print(f"[MV_URL] vid={video_id} extract {elapsed_ms:.0f}ms HIT", flush=True)
+            return picked[0], picked[1], False
+        print(f"[MV_URL] vid={video_id} extract {elapsed_ms:.0f}ms MISS", flush=True)
+        return None, 0, False
+    except Exception as e:
+        msg = str(e)
+        auth_fail_seen = bool(_AUTH_FAIL_RE.search(msg))
+        if auth_fail_seen:
+            print(f"[AUTH_FAIL][MV] vid={video_id} err={msg[:120]}", flush=True)
+        return None, 0, auth_fail_seen
+
+
+def _mv_probe_stream_url(url: str) -> bool:
+    """Playability probe for MV stream candidates — stricter than the audio
+    warm probe, and deliberately separate so the audio path stays untouched.
+
+    Rejects:
+      • non-200/206 or non-media responses (the get_song fast path routinely
+        hands back googlevideo URLs that 403 dead-on-arrival)
+      • fragmented MP4 (moof boxes): YouTube's MP4 video itags are DASH
+        fragments which a plain <video src> cannot progressively play.
+    WebM is inherently streamable and always accepted on a good response."""
+    if not url or not url.startswith(("https://", "http://")):
+        return False
+    headers = {
+        "User-Agent": _YDL_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+    }
+    try:
+        cookie_hdr = _cached_cookie_header()
+        if cookie_hdr:
+            headers["Cookie"] = cookie_hdr
+    except Exception:
+        pass
+    response = None
+    try:
+        session = _stream_curl if _stream_curl is not None else _fallback_proxy_session
+        response = session.get(url, headers=headers, timeout=8, stream=True)
+        if response.status_code not in (200, 206):
+            return False
+        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type and not (
+            content_type.startswith("video/") or
+            content_type in ("application/octet-stream", "binary/octet-stream")
+        ):
+            return False
+        chunk = next(response.iter_content(chunk_size=65536), b"")
+        if not chunk:
+            return False
+        if content_type.startswith("video/mp4") and b"moof" in chunk:
+            return False  # fragmented DASH MP4 — unplayable via <video src>
+        return True
+    except Exception as exc:
+        log.debug("MV stream probe failed: %s", exc)
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def resolve_mv_stream_url(video_id: str, tid: str, max_height: int = _MV_DEFAULT_MAX_HEIGHT,
+                          force: bool = False) -> dict:
+    """Resolve one video stream URL for an official music video.
+
+    Flow mirrors get_stream_url: cache lookup (force bypasses) → YTMusic
+    direct player fast path (probe-gated: dead fast-path URLs fall through)
+    → ONE yt-dlp extraction (also probe-verified). Only a probe-verified URL
+    is ever cached or served — the client's one stale-retry must never
+    receive the same dead URL twice. Cached entries are bound to the
+    mvVideoId; a different video for the same tid is a miss, never a
+    cross-serve."""
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        return {"error": "videoId required"}
+    key = _mv_stream_cache_key(tid, max_height)
+    if not force:
+        with _stream_cache_lock:
+            if key in _stream_cache:
+                cached = _stream_cache[key]
+                entry = cached if isinstance(cached, dict) else {"url": cached}
+                exp = entry.get("exp") or 0
+                url = entry.get("url") or ""
+                wrong_video = bool(entry.get("matchedVideoId")) and entry.get("matchedVideoId") != video_id
+                if wrong_video or (exp and exp <= time.time()):
+                    _stream_cache.pop(key, None)
+                else:
+                    _stream_cache.move_to_end(key)
+                    result = {"url": url, "cached": True}
+                    for k in ("maxHeight", "matchedVideoId"):
+                        if entry.get(k) is not None:
+                            result[k] = entry[k]
+                    return result
+    else:
+        with _stream_cache_lock:
+            _stream_cache.pop(key, None)
+
+    url, height = _ytmusic_player_video_url(video_id, max_height)
+    source = "ytmusic"
+    auth_fail_seen = False
+    if url and not _mv_probe_stream_url(url):
+        url, height = "", 0  # dead-on-arrival fast-path URL — fall through
+    if not url:
+        url, height, auth_fail_seen = _extract_mv_url_for_vid(video_id, max_height)
+        source = "ytdlp"
+        if url and not _mv_probe_stream_url(url):
+            url, height = "", 0  # unplayable format (e.g. fragmented MP4 only)
+    if not url:
+        return {"error": "Video stream not available"}
+    if not auth_fail_seen:
+        _cache_stream(key, url, "", {"matchedVideoId": video_id, "maxHeight": height})
+    return {"url": url, "maxHeight": height, "source": source, "matchedVideoId": video_id}
+
+
+def resolve_mv_stream_singleflight(video_id: str, tid: str,
+                                   max_height: int = _MV_DEFAULT_MAX_HEIGHT,
+                                   force: bool = False) -> dict:
+    """Share one MV video extraction between concurrent engagement requests.
+
+    Own coordination dict: video traffic never delays audio resolutions and
+    audio joiners never wait behind video. Forced stale-URL recovery bypasses
+    coordination, mirroring the audio single-flight."""
+    if force:
+        return resolve_mv_stream_url(video_id, tid, max_height, force=True)
+    key = f"{_mv_stream_cache_key(tid, max_height)}|{video_id}"
+    owner = False
+    with _mv_stream_resolution_lock:
+        entry = _mv_stream_resolution_inflight.get(key)
+        if entry is None:
+            entry = {"event": threading.Event(), "result": None}
+            _mv_stream_resolution_inflight[key] = entry
+            owner = True
+    if not owner:
+        if entry["event"].wait(timeout=30):
+            result = entry.get("result")
+            if isinstance(result, dict):
+                return dict(result)
+        # Owner exceeded the normal API timeout or died; fall back to a direct
+        # resolution as the final safety net.
+        return resolve_mv_stream_url(video_id, tid, max_height)
+    try:
+        result = resolve_mv_stream_url(video_id, tid, max_height)
+        entry["result"] = dict(result) if isinstance(result, dict) else result
+        return result
+    finally:
+        with _mv_stream_resolution_lock:
+            if _mv_stream_resolution_inflight.get(key) is entry:
+                _mv_stream_resolution_inflight.pop(key, None)
+            entry["event"].set()
+
 
 def _clean_search_tokens(query: str) -> str:
     q = " ".join(query.split())
@@ -2431,6 +2873,15 @@ def resolve_recording(title: str, artist: str, duration=None, album: str = "",
                       album_id: str = "", exclude_vid: str = "", force: bool = False) -> dict | None:
     """Resolve metadata to one stable YouTube recording, deduplicating concurrent searches."""
     identity = _recording_identity_signature(title, artist, duration, album, album_id)
+    # Album-agnostic fallback key: the same recording reached from different
+    # providers (iTunes search vs Spotify import vs a saved favorite) often
+    # carries slightly different album text, which would otherwise fragment the
+    # 45-day cache and force a fresh YTMusic search on every replay. Version
+    # tags and rounded duration stay in the key, so distinct material versions
+    # (live/remix/cover) never share a loose entry.
+    loose_identity = _recording_identity_signature(title, artist, duration)
+    if loose_identity == identity:
+        loose_identity = ""
     target = {"title": title, "artist": artist, "duration": duration, "album": album, "albumId": album_id}
     if not force:
         cached = _cached_recording_resolution(identity, exclude_vid=exclude_vid, target=target)
@@ -2438,13 +2889,19 @@ def resolve_recording(title: str, artist: str, duration=None, album: str = "",
             cached["cached"] = True
             cached["identity"] = identity
             return cached
+        if loose_identity:
+            cached = _cached_recording_resolution(loose_identity, exclude_vid=exclude_vid, target=target)
+            if cached:
+                cached["cached"] = True
+                cached["identity"] = identity
+                return cached
 
     owner = False
     with _recording_resolution_lock:
-        event = _recording_resolution_inflight.get(identity)
+        event = _recording_resolution_inflight.get(loose_identity or identity)
         if event is None:
             event = threading.Event()
-            _recording_resolution_inflight[identity] = event
+            _recording_resolution_inflight[loose_identity or identity] = event
             owner = True
     if not owner:
         completed = event.wait(timeout=12)
@@ -2453,6 +2910,12 @@ def resolve_recording(title: str, artist: str, duration=None, album: str = "",
             cached["cached"] = True
             cached["identity"] = identity
             return cached
+        if loose_identity:
+            cached = _cached_recording_resolution(loose_identity, exclude_vid=exclude_vid, target=target)
+            if cached:
+                cached["cached"] = True
+                cached["identity"] = identity
+                return cached
         if completed and force:
             return resolve_recording(
                 title, artist, duration, album, album_id,
@@ -2469,12 +2932,14 @@ def resolve_recording(title: str, artist: str, duration=None, album: str = "",
             return None
         best = ranked[0]
         _cache_recording_resolution(identity, best, source="search")
+        if loose_identity:
+            _cache_recording_resolution(loose_identity, best, source="search")
         result = dict(best)
         result["identity"] = identity
         return result
     finally:
         with _recording_resolution_lock:
-            _recording_resolution_inflight.pop(identity, None)
+            _recording_resolution_inflight.pop(loose_identity or identity, None)
             event.set()
 
 
@@ -2505,6 +2970,896 @@ def _prefetch_recording(track: dict) -> None:
                 _recording_prefetch_pending.discard(identity)
 
     _resolution_executor.submit(worker)
+
+# ── Official music-video (HD) resolution ──────────────────────────────────────
+#
+# Finds the official music video for a track — a DIFFERENT YouTube video than
+# the audio upload the recording resolver selects. Verification is popularity-
+# blind by design: no view counts, no whitelists, no chart services. An artist
+# with 500 views who self-uploaded an MV is detected through the same structural
+# signals as a VEVO act:
+#   1. YouTube's own OMV classification (MUSIC_VIDEO_TYPE_OMV, granted to any
+#      distributor/label-delivered upload regardless of artist size)
+#   2. Uploader-channel identity: the videos filter exposes the uploader's
+#      channel browseId, compared against the artist's own channel from the
+#      artists filter — the indie self-upload path
+#   3. Title recording-identity + version-profile + duration window, reusing
+#      the existing candidate machinery
+# "… – Topic" uploaders are rejected outright: they host the auto-generated
+# audio track, not a video.
+
+_MV_NOISE_RE = re.compile(
+    r"\bm\s*[./\\\-]?\s*v\b|\bvideoclip\b|\bv[ií]deo(?:\s+(?:clipe|oficial))?\b"
+    r"|\bclipe(?:\s+oficial)?\b|\bclip(?:\s+officiel)?\b|\bofficial mv\b",
+    re.I,
+)
+# Bracketed feature credits: 'SQUARE UP (feat. GUMI)' is the SAME recording as
+# 'SQUARE UP', but the shared _FEATURE_CREDIT_RE only strips credits preceded
+# by whitespace — the '(' blocks it, which cost 0.643-vs-0.68 title similarity
+# on real indie MV titles. Scoped to the MV path; the recording resolver keeps
+# its stricter behaviour.
+_MV_FEATURE_BRACKET_RE = re.compile(
+    r"[\(\[\{]\s*(?:feat(?:uring)?|ft|with)\.?\s+[^\)\]\}]*[\)\]\}]",
+    re.I,
+)
+_MV_HARD_REJECT_RE = re.compile(
+    r"\breaction\b|\b8d\b|\b1[ -]?hour\b|\bloop(?:ed)?\b|\bfull album\b|\btype beat\b|\bfree beat\b",
+    re.I,
+)
+# Artist-published lyric videos / visualizers / audio / translation uploads.
+# NEVER hard-rejected — the user-facing contract keeps them as valid FALLBACKS
+# when a song has no true MV — but they rank below official music videos.
+# ('Traducida al Español' surfaced as a real case: translation lyric uploads
+# carry none of the English markers.)
+_MV_DEMOTED_MARKER_RE = re.compile(
+    r"\blyric(?:s)?\b|\bvisuali[sz]er\b|\bletra\b|\bofficial audio\b|\baudio only\b"
+    r"|\(\s*audio\s*\)|\[\s*audio\s*\]"
+    r"|\btraducid[ao]\b|\btraducci[oó]n\b|\bsubtitulad[ao]\b|\btradução\b|\blegendad[ao]\b",
+    re.I,
+)
+# Official-MV markers on the RAW upload title (YTMusic strips these, which
+# once made the artist's own MV and lyric video indistinguishable).
+_MV_OFFICIAL_MARKER_RE = re.compile(
+    r"official\s+(?:music\s+)?video\b|\bofficial mv\b|\bm\s*[./\\\-]?\s*v\b"
+    r"|\bvideoclip\b|\bv[ií]deo(?:\s+(?:clipe|oficial))?\b|\bclip(?:\s+officiel)?\b",
+    re.I,
+)
+_MV_TOPIC_UPLOADER_RE = re.compile(r"\s*[-–]\s*topic\s*$", re.I)
+_MV_DURATION_TOLERANCE = 0.25  # MVs add intros/outros; allow ±25% of track length
+_MV_DURATION_FLOOR = 20.0      # seconds of absolute tolerance for short tracks
+_MV_VERIFY_BONUS = {"omv": 15, "channel": 10, "name": 2}
+_MV_MINIMUM = 68.0
+
+
+def _mv_clean_title(title: str) -> str:
+    """Strip music-video presentation markers YouTube titles carry.
+
+    K-pop and Latin uploads are commonly titled 'Song (M/V)' or
+    'Song (Vídeo Oficial)'. The shared identity machinery only knows the
+    English 'music video' phrasing, so normalise the extra markers to plain
+    'video' before the regular noise filter runs. The candidate then keeps
+    the same recording identity as the audio track.
+    """
+    text = _MV_FEATURE_BRACKET_RE.sub(" ", str(title or ""))
+    text = _MV_NOISE_RE.sub(" video ", text)
+    text = _IDENTITY_NOISE_RE.sub(" ", text)
+    text = re.sub(r"[\(\[\{]\s*[\-–—,:/.\s]*[\)\]\}]", " ", text)
+    return " ".join(text.split())
+
+
+def _mv_is_topic_uploader(name: str) -> bool:
+    """True for 'Artist - Topic' auto-generated audio channels.
+
+    Must be checked BEFORE any normalisation: _normalize_identity_text strips
+    the ' - topic' suffix, which would silently pass name checks."""
+    return bool(_MV_TOPIC_UPLOADER_RE.search(str(name or "").strip()))
+
+
+def _mv_artist_channels(artist: str) -> dict:
+    """Map of normalised artist channel names -> channel browseId.
+
+    BrowseIds come from the artists filter, which indexes any artist with a
+    YouTube Music presence — independent artists included. Cached for a month
+    in memory so one artist search is paid per unique artist per process."""
+    name = str(artist or "").strip()
+    if not name:
+        return {}
+    key = _normalize_identity_text(name)
+    with _mv_resolution_lock:
+        cached = _mv_artist_channels_cache.get(key)
+        if cached is not None and time.time() - cached["_ts"] < _MV_ARTIST_CHANNELS_TTL:
+            _mv_artist_channels_cache.move_to_end(key)
+            return dict(cached["channels"])
+    try:
+        results = ytmusic.search(name, filter="artists", limit=3) or []
+    except Exception as exc:
+        log.debug("MV artist channel lookup failed for %r: %s", name, exc)
+        return {}
+    channels = {}
+    for item in results:
+        browse_id = str(item.get("browseId") or "").strip()
+        artist_name = str(item.get("artist") or "").strip()
+        if browse_id and artist_name:
+            channels[_normalize_identity_text(artist_name)] = browse_id
+    with _mv_resolution_lock:
+        _mv_artist_channels_cache[key] = {"channels": dict(channels), "_ts": time.time()}
+        if len(_mv_artist_channels_cache) > _MV_ARTIST_CHANNELS_MAX:
+            _mv_artist_channels_cache.popitem(last=False)
+    return dict(channels)
+
+
+def _mv_verify_uploader(target_artist: str, candidate: dict, artist_channels) -> tuple[bool, str]:
+    """Return (verified, method) for an MV candidate's uploader.
+
+    Never uses popularity signals. 'omv' = YouTube's own official-music-video
+    classification; 'channel' = uploader browseId is one of the artist's own
+    channels (indie self-upload path); 'name' = fallback when the artist has
+    no indexable artist channel at all, accepted with a low bonus.
+
+    artist_channels may be a dict OR a zero-arg callable returning one (the
+    lazy provider resolve_mv builds). The callable resolves ONLY when the
+    channel check is actually reached — OMV-classified candidates verify
+    first and never pay the artists-filter search."""
+    uploader = str(candidate.get("uploader") or "")
+    if _mv_is_topic_uploader(uploader):
+        return False, "topic"  # auto-generated audio upload, never a video
+    video_type = str(candidate.get("videoType") or "").upper()
+    if video_type.endswith("_OMV"):
+        return True, "omv"
+    if callable(artist_channels):
+        artist_channels = artist_channels() or {}
+    channel_id = str(candidate.get("uploaderChannelId") or "")
+    if channel_id and channel_id in set((artist_channels or {}).values()):
+        return True, "channel"
+    if not channel_id or not artist_channels:
+        # Safety valve for artists without an indexable artist channel.
+        # Impersonator display names are the residual risk here, which is
+        # why this path earns the lowest bonus and requires artist-name
+        # compatibility on top.
+        if uploader and _artist_identity_compatible(target_artist, uploader) and not _mv_is_topic_uploader(uploader):
+            return True, "name"
+    return False, ""
+
+
+def _score_mv_candidate(target: dict, candidate: dict, artist_channels: dict | None = None) -> dict:
+    """Score a videos-filter candidate as a potential official music video.
+
+    Builds on _score_track_candidate (title identity, artist compatibility,
+    version-profile drift, duration) with MV-specific gates: the never-valid
+    hard-reject list, the asymmetric MV duration window, and popularity-blind
+    uploader verification. Artist lyric/visualizer/audio uploads are NOT
+    rejected — they take a rankScore hit so a true MV outranks them, but a
+    song whose only video is the artist's lyric video still resolves.
+
+    artist_channels may be a dict OR a zero-arg callable returning one (the
+    lazy provider resolve_mv builds: mainstream songs whose candidates are
+    all OMV-classified never need the artists-filter search at all).
+
+    The duration gate is TIERED by verification strength (real regression:
+    'Anti-Hero', a 200s song whose official OMV on the artist's own channel
+    runs 310s — the fixed window hard-rejected it and the 7-day negative
+    locked the song out for a week):
+      - shorter-than-track stays a hard reject at every tier (a much
+        shorter video is a cut/different edit);
+      - weakly verified ('name' fallback) keeps the hard long window too —
+        impersonator display names are the residual risk there;
+      - STRONGLY verified ('omv' classification / artist channel) may
+        exceed the window up to 3x the track length with a capped ranking
+        penalty: title/artist identity is the real wrong-video guard, and
+        cinematic MVs genuinely run long (Thriller is 2.3x its track).
+    """
+    raw_title = str(candidate.get("title") or "")
+    target_title = str(target.get("title") or "")
+    if _MV_HARD_REJECT_RE.search(raw_title) and not _MV_HARD_REJECT_RE.search(target_title):
+        return {"acceptable": False, "score": 0.0, "reason": "presentation", "verifiedBy": ""}
+    demoted = bool(_MV_DEMOTED_MARKER_RE.search(raw_title)) and not _MV_DEMOTED_MARKER_RE.search(target_title)
+    cleaned_candidate = dict(candidate)
+    cleaned_candidate["title"] = _mv_clean_title(raw_title)
+    cleaned_target = dict(target)
+    cleaned_target["title"] = _mv_clean_title(target_title)
+    target_duration = _coerce_duration_seconds(target.get("duration"))
+    candidate_duration = _coerce_duration_seconds(candidate.get("duration"))
+    verified, method = _mv_verify_uploader(target.get("artist") or "", candidate, artist_channels)
+    if not verified:
+        return {"acceptable": False, "score": 0.0, "reason": "uploader", "verifiedBy": method}
+    long_overshoot = 0.0
+    if target_duration is not None and candidate_duration is not None:
+        # ASYMMETRIC window: MVs legitimately add video-only content —
+        # cinematic intros/outros (real case: 'Machine Love', 217s song vs a
+        # 287s MV = 70s of padding) — so a LONGER candidate is tolerated
+        # generously. A much SHORTER one is a cut/different edit and stays
+        # strict. Real-world regression: the symmetric 25% window rejected
+        # the artist's own official MV and cached the negative for 7 days.
+        allowed_long = max(45.0, target_duration * 0.45)
+        allowed_short = max(20.0, target_duration * 0.25)
+        delta = candidate_duration - target_duration
+        if -delta > allowed_short:
+            return {"acceptable": False, "score": 0.0, "reason": "duration", "verifiedBy": method}
+        if delta > allowed_long:
+            strongly_verified = method in ("omv", "channel")
+            if not strongly_verified or delta > max(allowed_long, target_duration * 3.0):
+                # Weakly verified keeps the strict window; even a strongly
+                # verified 3x+ candidate is mixtape/compilation territory.
+                return {"acceptable": False, "score": 0.0, "reason": "duration", "verifiedBy": method}
+            # Strongly verified padding: survive with a capped ranking
+            # penalty (see docstring) — never a false 7-day negative.
+            long_overshoot = delta - allowed_long
+    base = _score_track_candidate(cleaned_target, cleaned_candidate)
+    score = base["score"] + _MV_VERIFY_BONUS.get(method, 0)
+    if demoted:
+        # Lyric video / visualizer / audio upload by the artist: valid, but
+        # the true official MV must outrank it even with a worse duration
+        # match (real case: 'Dracula' — the MV runs 27s longer and lost the
+        # duration-tie roulette before rankScore existed).
+        score -= 30
+    if target_duration is not None and candidate_duration is not None:
+        # MV-context duration correction: the shared scorer penalises >20s
+        # deltas (−12), which inverts the MV case — official MVs run LONGER
+        # than the track (cinematic padding, the same insight as the
+        # asymmetric window). Cancel that penalty inside the window so a
+        # padded true MV is not outranked by same-length lyric uploads;
+        # short-side strictness is untouched.
+        delta = candidate_duration - target_duration
+        if 20 < delta <= allowed_long:
+            score += 12
+    if long_overshoot > 0:
+        # Beyond-window cinematic padding on a STRONGLY verified candidate:
+        # ranking pressure only (capped at −10 so Thriller-scale shorts still
+        # resolve above the minimum).
+        score -= min(10.0, long_overshoot / 8.0)
+    acceptable = bool(base["acceptable"]) and score >= _MV_MINIMUM
+    return {
+        "acceptable": acceptable,
+        "score": round(min(score, 99.0), 2),
+        "rankScore": round(score, 3),
+        "reason": "" if acceptable else "identity",
+        "verifiedBy": method,
+        "titleSimilarity": base.get("titleSimilarity"),
+        "artistSimilarity": base.get("artistSimilarity"),
+        "durationDelta": base.get("durationDelta"),
+    }
+
+
+def _rank_mv_candidates(target: dict, candidates: list, artist_channels: dict | None = None,
+                        minimum: float = _MV_MINIMUM) -> list:
+    ranked = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        match = _score_mv_candidate(target, candidate, artist_channels)
+        # Order by rankScore (uncapped): the 99-point confidence cap made
+        # every strong candidate tie, turning multi-upload picks into
+        # search-order roulette.
+        if match["acceptable"] and match["score"] >= minimum:
+            enriched = dict(candidate)
+            enriched["_match"] = match
+            ranked.append(enriched)
+    ranked.sort(key=lambda item: item["_match"]["rankScore"], reverse=True)
+    return ranked
+
+
+def _mv_song_payload(video_id: str) -> dict:
+    """The full get_song payload for a video — one watch-page-sized call.
+
+    The disambiguation scan (raw upload titles) and the HD probe (streaming
+    formats) both consume this SAME payload; fetching it once and sharing is
+    what keeps a cold resolve at ONE get_song round-trip."""
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        return {}
+    try:
+        return ytmusic.get_song(video_id) or {}
+    except Exception as exc:
+        log.debug("MV song payload unavailable for %s: %s", video_id, exc)
+        return {}
+
+
+def _mv_title_from_payload(payload: dict) -> str:
+    """The RAW upload title from a get_song payload — with the presentation
+    markers YTMusic strips. 'Dracula (Official Video)' vs the cleaned
+    'Dracula'. Source: microformat linkAlternates, videoDetails.title as the
+    fallback. Empty string on failure (tier falls back to neutral)."""
+    try:
+        micro = (payload.get("microformat") or {}).get("microformatDataRenderer") or {}
+        for alt in micro.get("linkAlternates") or []:
+            title = str(alt.get("title") or "").strip()
+            if title:
+                return title
+        details = payload.get("videoDetails") or {}
+        return str(details.get("title") or "")
+    except Exception:
+        return ""
+
+
+def _mv_upload_title(video_id: str) -> str:
+    """The RAW upload title for a video (compatibility wrapper — see
+    _mv_song_payload/_mv_title_from_payload for the shared-payload path)."""
+    return _mv_title_from_payload(_mv_song_payload(video_id))
+
+
+def _mv_upload_tier(upload_title: str) -> int:
+    """Ranking tier from the RAW upload title.
+
+    0 = official music video (official markers present; an official video
+        WITH subtitles/translation still IS the MV)
+    1 = markerless (neutral — ranking falls back to rankScore)
+    2 = the artist's lyric / visualizer / audio / translation upload
+        (fallback tier: kept, but a true MV always outranks it)"""
+    text = str(upload_title or "")
+    if _MV_OFFICIAL_MARKER_RE.search(text):
+        return 0
+    if _MV_DEMOTED_MARKER_RE.search(text):
+        return 2
+    return 1
+
+
+def _mv_disambiguate_by_upload_title(ranked: list, limit: int = 6) -> list:
+    """Tie-break verified candidates by their RAW upload titles.
+
+    Real-world regression ('Dracula'): YTMusic strips presentation markers,
+    so the artist's official MV and their official lyric video all surface
+    as clean-titled OMVs — and the MV ran 27s longer, so four same-length
+    lyric uploads outranked it on score and a fixed shortlist never reached
+    it. This scan reads raw titles IN RANK ORDER and stops at the first
+    official-marker hit — the highest-ranked true MV; every earlier
+    (higher-ranked) candidate was necessarily tier 1/2. Lyric-only songs
+    scan the bounded set and pick their best fallback.
+
+    Cost discipline — a cold resolve must not pay per-candidate watch-page
+    payloads it can avoid:
+      * FAST PATH: when the TOP-ranked candidate's SEARCH title already
+        carries an official marker, it is tier 0 and nothing below can
+        outrank a tier 0 — zero get_song calls. (Search titles are either
+        raw or marker-stripped, never marker-fabricated: a marker present in
+        a search title is genuine.)
+      * In the scan, candidates whose SEARCH title carries ANY marker are
+        tiered from it directly; only markerless titles pay the get_song
+        read of the raw upload title.
+      * Every fetched payload is attached to its candidate (_songPayload)
+        so the HD probe reuses it instead of re-fetching."""
+    if len(ranked) < 2:
+        return ranked
+    if _MV_OFFICIAL_MARKER_RE.search(str(ranked[0].get("title") or "")):
+        # Top-ranked is provably the highest tier — disambiguation is a
+        # no-op. This is the mainstream-MV path (most search results keep
+        # their '(Official Video)' markers), so it must cost zero calls.
+        return ranked
+    scan = ranked[:limit]
+    decorated = []
+    for cand in scan:
+        search_title = str(cand.get("title") or "")
+        if _MV_OFFICIAL_MARKER_RE.search(search_title) or _MV_DEMOTED_MARKER_RE.search(search_title):
+            upload_title = search_title
+            payload = None
+        else:
+            payload = _mv_song_payload(str(cand.get("videoId") or ""))
+            if payload:
+                cand["_songPayload"] = payload  # reused by the HD probe
+            upload_title = _mv_title_from_payload(payload)
+        tier = _mv_upload_tier(upload_title)
+        rank_score = float((cand.get("_match") or {}).get("rankScore") or 0)
+        decorated.append((tier, -rank_score, str(cand.get("videoId") or "")))
+        if tier == 0:
+            # Highest-ranked true MV found — later candidates are lower
+            # rankScore, so no later tier-0 can beat it. Stop reading.
+            break
+    decorated.sort()
+    by_id = {str(c.get("videoId") or ""): c for c in scan}
+    classified = [by_id[vid] for _t, _r, vid in decorated]
+    seen = {vid for _t, _r, vid in decorated}
+    rest = [c for c in ranked if str(c.get("videoId") or "") not in seen]
+    return classified + rest
+
+
+def _load_mv_resolutions_locked() -> OrderedDict:
+    global _mv_resolution_cache
+    if _mv_resolution_cache is not None:
+        return _mv_resolution_cache
+    entries = OrderedDict()
+    try:
+        if MV_RESOLUTIONS_JSON.exists():
+            doc = json.loads(MV_RESOLUTIONS_JSON.read_text(encoding="utf-8"))
+            if isinstance(doc, dict) and doc.get("schema") == _MV_RESOLUTION_SCHEMA:
+                for key, value in (doc.get("entries") or {}).items():
+                    if not (isinstance(value, dict) and "hasMV" in value):
+                        continue
+                    if value.get("hasMV") and not value.get("mvVideoId"):
+                        continue
+                    # Resolver-version gate: an entry written by a different
+                    # resolution generation is a stale pick — dropped on
+                    # load, never served. The purged dict persists on the
+                    # next save, so the disk self-heals without any scrub.
+                    if value.get("rv") != _MV_RESOLVER_VERSION:
+                        continue
+                    entries[str(key)] = value
+    except Exception as exc:
+        log.warning(f"MV resolution cache could not be loaded: {exc}")
+    _mv_resolution_cache = entries
+    return entries
+
+
+def _save_mv_resolutions_locked() -> None:
+    cache = _load_mv_resolutions_locked()
+    while len(cache) > _MV_RESOLUTION_MAX:
+        cache.popitem(last=False)
+    _atomic_write_json(MV_RESOLUTIONS_JSON, {
+        "schema": _MV_RESOLUTION_SCHEMA,
+        "entries": cache,
+    })
+
+
+def _cached_mv_resolution(identity: str) -> dict | None:
+    """Return a fresh cache entry, or None on miss / TTL expiry.
+
+    Positive and negative entries age at different rates (45d vs 7d)."""
+    if not identity:
+        return None
+    with _mv_resolution_lock:
+        cache = _load_mv_resolutions_locked()
+        entry = cache.get(identity)
+        if not entry:
+            return None
+        age = time.time() - float(entry.get("resolvedAt") or 0)
+        ttl = _MV_RESOLUTION_TTL if entry.get("hasMV") else _MV_RESOLUTION_NEG_TTL
+        if age > ttl:
+            cache.pop(identity, None)
+            try:
+                _save_mv_resolutions_locked()
+            except Exception as exc:
+                log.debug("Expired MV cache entry could not be removed: %s", exc)
+            return None
+        cache.move_to_end(identity)
+        return dict(entry)
+
+
+def _cache_mv_resolution(identity: str, result: dict) -> None:
+    """Persist one MV resolution. hasMV=False entries are negatives and inherit
+    the short TTL automatically via _cached_mv_resolution."""
+    if not identity or not isinstance(result, dict) or "hasMV" not in result:
+        return
+    entry = dict(result)
+    entry["rv"] = _MV_RESOLVER_VERSION
+    entry["resolvedAt"] = time.time()
+    with _mv_resolution_lock:
+        cache = _load_mv_resolutions_locked()
+        cache[identity] = entry
+        cache.move_to_end(identity)
+        try:
+            _save_mv_resolutions_locked()
+        except Exception as exc:
+            log.warning(f"MV resolution cache could not be saved: {exc}")
+
+
+def _mv_probe_height(video_id: str, payload: dict | None = None) -> int:
+    """Best-effort max video height. 0 when the probe fails — the caller
+    still reports the MV, just without an HD claim.
+
+    PIGGYBACK-ONLY by design: this probe reads the get_song payload the
+    disambiguation scan already fetched (payload=). In the app's production
+    auth mode get_song streamingData carries no usable video formats, so a
+    DEDICATED probe call would have paid a full watch-page round-trip per
+    positive resolution for a value that is empirically always 0 — and no
+    consumer reads maxHeight anyway (the real cap is computed engagement-
+    time by /api/mv/stream's yt-dlp extraction). No payload in hand → 0,
+    never a network call."""
+    if payload is None:
+        return 0
+    try:
+        status = (payload.get("playabilityStatus") or {}).get("status")
+        if status and status != "OK":
+            return 0
+        streaming = payload.get("streamingData") or {}
+        formats = list(streaming.get("adaptiveFormats") or []) + list(streaming.get("formats") or [])
+        heights = []
+        for item in formats:
+            mime = str(item.get("mimeType") or "").lower()
+            url = str(item.get("url") or "")
+            if url.startswith("https://") and mime.startswith("video/"):
+                try:
+                    heights.append(int(item.get("height") or 0))
+                except (TypeError, ValueError):
+                    pass
+        return max(heights) if heights else 0
+    except Exception as exc:
+        log.debug("MV HD probe unavailable for %s: %s", video_id, exc)
+        return 0
+
+
+# ── Audio-comparative sync (intro alignment) ──────────────────────────────────
+#
+# MVs often open with dialogue/cold-opens before the song starts. Instead of
+# mapping playback time 1:1 onto the video, we align the track's canonical
+# audio (the resolved recording — usually a topic upload, cache-warm) with
+# the MV's own audio: download a bounded prefix of both, decode to RMS
+# envelopes via ffmpeg, and cross-correlate. The peak lag IS where the song
+# begins in the MV; playback then skips the video straight there
+# (v.currentTime = AUDIO.currentTime + introOffset).
+#
+# Cost profile: two bounded downloads (~2MB total) + one ffmpeg decode pair,
+# ONCE per track (persisted in the 45-day resolution entry, never recomputed
+# while fresh). Computed lazily on the hidden viewer-open resolve, so the
+# user only ever sees the result.
+
+_MV_OFFSET_BIN = 0.1        # envelope bin size, seconds
+_MV_OFFSET_WINDOW = 20.0    # correlation window, seconds of the track's start
+_MV_OFFSET_MIN_LAG = -15.0  # MV may also be a cut edit (negative = song clipped)
+_MV_OFFSET_MAX_LAG = 120.0  # longest intro to search, seconds (cinematic MVs)
+_MV_OFFSET_MIN_SCORE = 0.6  # normalised correlation peak required to accept
+_MV_OFFSET_RETRY_SEC = 6 * 3600  # cooldown before re-attempting a failed measurement
+
+
+def _mv_fetch_prefix(url: str, max_bytes: int, deadline_sec: float = 10.0) -> bytes:
+    """Bounded, DEADLINED prefix read of an upstream media URL.
+
+    googlevideo can trickle a multi-MB prefix at tens of KB/s without ever
+    tripping per-socket timeouts — an undelined read stalled the offset
+    endpoint for a full minute. The total wall-clock deadline cuts the read
+    short and works with whatever arrived: a partial MV prefix simply
+    narrows the intro search range instead of failing."""
+    if not url or not url.startswith("https://"):
+        return b""
+    headers = {
+        "User-Agent": _YDL_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Range": f"bytes=0-{max(0, max_bytes - 1)}",
+    }
+    try:
+        cookie_hdr = _cached_cookie_header()
+        if cookie_hdr:
+            headers["Cookie"] = cookie_hdr
+    except Exception:
+        pass
+    response = None
+    try:
+        session = _stream_curl if _stream_curl is not None else _fallback_proxy_session
+        response = session.get(url, headers=headers, timeout=10, stream=True)
+        if response.status_code not in (200, 206):
+            return b""
+        started = time.perf_counter()
+        collected = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            collected.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+            if time.perf_counter() - started > deadline_sec:
+                log.debug("MV prefix fetch hit its %.0fs deadline at %dKB", deadline_sec, total // 1024)
+                break
+        return b"".join(collected)
+    except Exception as exc:
+        log.debug("MV offset prefix fetch failed: %s", exc)
+        return b""
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def _mv_decode_pcm(data: bytes):
+    """Decode a media prefix to mono 8kHz s16 PCM via the bundled ffmpeg."""
+    ffmpeg_dir = _resolve_ffmpeg_location()
+    if not ffmpeg_dir or not data:
+        return None
+    exe = ffmpeg_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    try:
+        proc = subprocess.Popen(
+            [str(exe), "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(data, timeout=12)
+        if proc.returncode != 0 or not out:
+            return None
+        return out
+    except Exception as exc:
+        log.debug("MV offset ffmpeg decode failed: %s", exc)
+        return None
+
+
+def _mv_audio_stream_url(video_id: str) -> str:
+    """A byte-validated audio URL for offset analysis.
+
+    The shared audio resolver hands out unvalidated get_song fast-path URLs
+    whose WEB_REMIX signatures are dead-on-arrival in this environment (403
+    to every header set we use). Playback survives those via the proxy's
+    stale-eviction + client retry; this helper replicates that: probe the
+    resolved URL, and when it is dead evict it and run one direct yt-dlp
+    audio extraction, caching the good URL under mvoffset:{vid} so retries
+    stay free."""
+    key = f"mvoffset:{video_id}"
+    url = (resolve_stream_singleflight(
+        f"mv audio {video_id}", key, video_id,
+    ) or {}).get("url") or ""
+    if url and _probe_stream_url(url):
+        return url
+    if url:
+        with _stream_cache_lock:
+            _stream_cache.pop(key, None)  # dead entry: evict like the proxy does
+
+    fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+    ydl_opts = {
+        "format": fmt,
+        **_YDL_EXTRACT_OPTS,
+        "http_headers": {"User-Agent": _YDL_USER_AGENT},
+        **_ydl_extras(),
+    }
+    try:
+        started = time.perf_counter()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False) or {}
+        formats = [f for f in (info.get("formats") or []) if isinstance(f, dict) and f.get("url")]
+        strict = [f for f in formats if (f.get("vcodec") or "") == "none"]
+        best = ""
+        if strict:
+            best = str(max(strict, key=lambda f: (
+                {"m4a": 3, "webm": 2}.get(f.get("ext", ""), 0), f.get("tbr") or 0))["url"])
+        elif not formats:
+            best = str(info.get("url") or "")
+        if best:
+            print(f"[MV_OFFSET] vid={video_id} audio extract {(time.perf_counter() - started) * 1000:.0f}ms", flush=True)
+            _cache_stream(key, best, "", {})
+            return best
+    except Exception as exc:
+        log.debug("MV offset audio extraction failed for %s: %s", video_id, exc)
+    return ""
+
+
+def _mv_audio_envelope(video_id: str, seconds: float):
+    """RMS envelope (100ms bins) of a video's first `seconds` of audio.
+    Returns a numpy array or None (numpy missing / no URL / decode fail)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None  # frozen builds without numpy: feature degrades to 0-offset
+    try:
+        url = _mv_audio_stream_url(video_id)
+        if not url:
+            return None
+        prefix = _mv_fetch_prefix(url, int(seconds * 16384) + 65536)
+        pcm = _mv_decode_pcm(prefix)
+        if not pcm:
+            return None
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size < 8000:
+            return None  # under a second — unusable
+        per_bin = int(_MV_OFFSET_BIN * 8000)
+        n = samples.size // per_bin
+        trimmed = samples[:n * per_bin].reshape(n, per_bin)
+        return np.sqrt((trimmed ** 2).mean(axis=1))
+    except Exception as exc:
+        log.debug("MV audio envelope failed for %s: %s", video_id, exc)
+        return None
+
+
+def _mv_correlate_offset(env_ref, env_mv):
+    """Normalized cross-correlation of the track envelope against the MV's.
+
+    Returns the MV-side lag (seconds) where the song begins: 0.0 = aligned
+    start, positive = skip-forward intro, negative = cut edit. None when no
+    lag clears the confidence floor (callers then treat it as 0)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        ref = np.asarray(env_ref, dtype=np.float64)
+        mv = np.asarray(env_mv, dtype=np.float64)
+        window = int(round(_MV_OFFSET_WINDOW / _MV_OFFSET_BIN))
+        if ref.size < window or mv.size < window:
+            return None
+        best_score, best_lag = -1.0, 0
+        min_lag = int(_MV_OFFSET_MIN_LAG / _MV_OFFSET_BIN)
+        max_lag = int(_MV_OFFSET_MAX_LAG / _MV_OFFSET_BIN)
+        # Scan outward from zero: beat-periodic envelopes produce many
+        # near-equal peaks, and the minimal-shift one is the true alignment
+        # (strict improvement keeps proximity as the tie-break).
+        lags = [0]
+        for d in range(1, max(max_lag, -min_lag) + 1):
+            if d <= max_lag:
+                lags.append(d)
+            if d <= -min_lag:
+                lags.append(-d)
+        for lag in lags:
+            ro = max(0, -lag)   # ref-side offset for cut edits
+            vo = max(0, lag)
+            if ro + window > ref.size or vo + window > mv.size:
+                continue
+            a = ref[ro:ro + window]
+            b = mv[vo:vo + window]
+            a = a - a.mean()
+            b = b - b.mean()
+            na = float(np.linalg.norm(a))
+            nb = float(np.linalg.norm(b))
+            if na < 1e-9 or nb < 1e-9:
+                continue  # silence windows cannot anchor the alignment
+            score = float((a * b).sum() / (na * nb))
+            if score > best_score + 1e-6:
+                best_score, best_lag = score, lag
+        if best_score < _MV_OFFSET_MIN_SCORE:
+            return None
+        return round(best_lag * _MV_OFFSET_BIN, 2)
+    except Exception as exc:
+        log.debug("MV offset correlation failed: %s", exc)
+        return None
+
+
+def _mv_resolve_intro_offset(mv_video_id: str, title: str, artist: str, duration=None):
+    """Where does the song begin inside the MV? Acoustic answer, cached by
+    the caller in the 45-day resolution entry. 0.0 when the MV IS the
+    canonical audio or alignment confirms an aligned start; None when the
+    answer is unavailable (treated as 0 so it never blocks playback)."""
+    try:
+        resolved = resolve_recording(title, artist, duration) or {}
+        audio_vid = str(resolved.get("videoId") or "")
+    except Exception:
+        audio_vid = ""
+    if not audio_vid:
+        return None
+    if audio_vid == str(mv_video_id):
+        return 0.0  # the MV is the topic audio itself — trivially aligned
+    env_mv = _mv_audio_envelope(mv_video_id, _MV_OFFSET_MAX_LAG + _MV_OFFSET_WINDOW + 5)
+    env_ref = _mv_audio_envelope(audio_vid, _MV_OFFSET_WINDOW + 8)
+    if env_mv is None or env_ref is None:
+        return None
+    return _mv_correlate_offset(env_ref, env_mv)
+
+
+def resolve_mv(title: str, artist: str, duration=None, force: bool = False) -> dict | None:
+    """Resolve the official music video for a recording, deduplicating
+    concurrent searches. Returns a result dict always containing `hasMV`;
+    None only for transient failures (nothing cached in that case)."""
+    title = str(title or "").strip()
+    artist = str(artist or "").strip()
+    if not title or not artist:
+        return None
+    identity = _recording_identity_signature(title, artist, duration)
+    if not force:
+        cached = _cached_mv_resolution(identity)
+        if cached is not None:
+            cached["cached"] = True
+            cached["identity"] = identity
+            return cached
+
+    owner = False
+    with _mv_resolution_lock:
+        event = _mv_resolution_inflight.get(identity)
+        if event is None:
+            event = threading.Event()
+            _mv_resolution_inflight[identity] = event
+            owner = True
+    if not owner:
+        completed = event.wait(timeout=12)
+        cached = _cached_mv_resolution(identity)
+        if cached is not None:
+            cached["cached"] = True
+            cached["identity"] = identity
+            return cached
+        if completed and force:
+            return resolve_mv(title, artist, duration, force=True)
+        return None
+
+    try:
+        target = {"title": _mv_clean_title(title), "artist": artist, "duration": duration}
+        query = " ".join(part for part in (artist, title) if part).strip()
+        candidates = []
+        try:
+            results = ytmusic.search(query, filter="videos", limit=12) or []
+        except Exception as exc:
+            log.debug("MV videos search failed for %r: %s", query, exc)
+            return None  # transient upstream failure — never cache
+        for item in results:
+            video_id = str(item.get("videoId") or "").strip()
+            if not video_id:
+                continue
+            artists_runs = item.get("artists") or []
+            uploader = str((artists_runs[0] or {}).get("name") or "") if artists_runs else ""
+            uploader_channel = str((artists_runs[0] or {}).get("id") or "") if artists_runs else ""
+            thumbnails = item.get("thumbnails") or []
+            candidates.append({
+                "title": item.get("title", ""),
+                "artist": ", ".join(str(a.get("name") or "") for a in artists_runs if a.get("name")),
+                "uploader": uploader,
+                "uploaderChannelId": uploader_channel,
+                "duration": item.get("duration_seconds") or _coerce_duration_seconds(item.get("duration")),
+                "videoId": video_id,
+                "videoType": item.get("videoType", ""),
+                "art": thumbnails[-1].get("url", "") if thumbnails and isinstance(thumbnails[-1], dict) else "",
+            })
+        # Artist channels are fetched LAZILY (memoised per call): the artists-
+        # filter search costs a full round-trip, and mainstream songs whose
+        # candidates are all OMV-classified never consult it at all — the
+        # omv verification path fires first. Indie self-uploads (UGV on the
+        # artist's own channel) pay it once, then the month-long artist
+        # cache serves every later resolve.
+        channels_box: list = []
+        def _channels() -> dict:
+            if not channels_box:
+                channels_box.append(_mv_artist_channels(artist))
+            return channels_box[0]
+        ranked = _rank_mv_candidates(target, candidates, _channels)
+        if len(ranked) > 1:
+            # Multi-upload disambiguation: the artist's own MV vs their own
+            # lyric video can tie on cleaned titles — the raw upload title
+            # decides (once per recording, bounded to the top few).
+            ranked = _mv_disambiguate_by_upload_title(ranked)
+        result = {
+            "hasMV": False,
+            "identity": identity,
+            "resolvedAt": time.time(),
+        }
+        if ranked:
+            best = ranked[0]
+            match = best.get("_match") or {}
+            # HD probe reuses the payload the disambiguation scan already
+            # fetched — a cold resolve NEVER pays a dedicated get_song for a
+            # decorative hint (see _mv_probe_height).
+            result = {
+                "hasMV": True,
+                "mvVideoId": str(best.get("videoId") or ""),
+                "title": str(best.get("title") or "")[:500],
+                "uploader": str(best.get("uploader") or "")[:500],
+                "uploaderChannelId": str(best.get("uploaderChannelId") or "")[:256],
+                "videoType": str(best.get("videoType") or "")[:128],
+                "art": str(best.get("art") or "")[:4096],
+                "maxHeight": _mv_probe_height(str(best.get("videoId") or ""),
+                                               payload=best.get("_songPayload")),
+                "confidence": float(match.get("score") or 0),
+                "verifiedBy": str(match.get("verifiedBy") or ""),
+                "identity": identity,
+                "resolvedAt": time.time(),
+            }
+            result["hasHD"] = bool(result["maxHeight"] >= 720)
+        else:
+            # Searched successfully but nothing verified as an official MV.
+            # Negative entries expire in 7 days so new indie uploads appear.
+            result["reason"] = "no-candidates" if candidates else "no-results"
+        # A force re-resolve rebuilds this entry — an ALREADY-MEASURED intro
+        # alignment must survive it (re-measuring costs a full audio pass).
+        with _mv_resolution_lock:
+            prev = _load_mv_resolutions_locked().get(identity) or {}
+        if prev.get("introOffset") is not None and "introOffset" not in result:
+            result["introOffset"] = prev["introOffset"]
+            result.pop("introOffsetAttempt", None)
+        _cache_mv_resolution(identity, result)
+        return dict(result)
+    finally:
+        with _mv_resolution_lock:
+            _mv_resolution_inflight.pop(identity, None)
+            event.set()
+
+
+def _prefetch_mv(track: dict) -> None:
+    """Queue look-ahead MV resolution. Recording-level only: no stream URLs
+    are minted here, so the queue stays cheap and googlevideo URLs stay tied
+    to actual engagement."""
+    title = str(track.get("title") or track.get("name") or "").strip()
+    artist = str(track.get("artist") or track.get("artist_name") or "").strip()
+    if not title or not artist:
+        return
+    duration = track.get("duration") or track.get("dur")
+    identity = _recording_identity_signature(title, artist, duration)
+    if _cached_mv_resolution(identity) is not None:
+        return
+    with _mv_resolution_lock:
+        if identity in _mv_prefetch_pending:
+            return
+        _mv_prefetch_pending.add(identity)
+
+    def worker():
+        try:
+            resolve_mv(title, artist, duration)
+        finally:
+            with _mv_resolution_lock:
+                _mv_prefetch_pending.discard(identity)
+
+    _resolution_executor.submit(worker)
+
 
 def yt_music_search(query: str, limit: int = 7) -> list:
     if not query.strip(): return []
@@ -3594,6 +4949,12 @@ def api_stream():
     if result.get("url") and not result.get("local"):
         stream_identity = _recording_identity_signature(title, artist, duration, album, album_id) if title and artist else ""
         _cache_stream(tid, result["url"], stream_identity, result)
+        if _c == "mobile-player-native":
+            # Trusted in-app native player only: also hand over the raw signed
+            # media URL so ExoPlayer fetches bytes directly with the platform
+            # TLS stack instead of another loopback proxy hop. WebView
+            # renderers keep using the proxy `url` below.
+            result["direct_url"] = result["url"]
     result["url"] = f"/api/proxy_stream?url_key={tid}"
     if not _c.startswith("mobile-player"):
         result["streamUrl"] = result["url"]
@@ -3836,6 +5197,9 @@ def api_stream_prefetch():
     scope = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(data.get("scope") or mode))[:80] or mode
     generation = str(data.get("generation") or time.time_ns())[:80]
     immediate = bool(data.get("immediate"))
+    # The client opts the look-ahead window into MV resolution so zero MV work
+    # happens while the HD-video feature is disabled.
+    include_mv = bool(data.get("include_mv"))
     with _stream_warm_lock:
         if scope not in _stream_warm_latest and len(_stream_warm_latest) >= 100:
             _stream_warm_latest.pop(next(iter(_stream_warm_latest)), None)
@@ -3858,10 +5222,184 @@ def api_stream_prefetch():
             continue
         if mode == "stream":
             accepted += int(_queue_stream_warm(track, scope, generation, immediate))
-        elif not track["videoId"]:
-            _prefetch_recording(track)
-            accepted += 1
+        else:
+            if not track["videoId"]:
+                _prefetch_recording(track)
+                accepted += 1
+            if include_mv:
+                _prefetch_mv(track)
     return jsonify({"success": True, "queued": accepted, "mode": mode}), 202
+
+
+@app.route("/api/mv/resolve")
+def api_mv_resolve():
+    """Resolve the official HD music video for a track.
+
+    Popularity-blind: any artist with a self-uploaded MV on their own channel
+    resolves exactly like a VEVO act. force=1 bypasses both cache TTLs so the
+    manual retry path can pick up newly uploaded videos immediately."""
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+    duration = _coerce_duration_seconds(request.args.get("duration"))
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
+    if not title or not artist:
+        return jsonify({"error": "title and artist required"}), 400
+    _burst_check("mv", f"{title[:30]} | {artist[:20]}")
+    try:
+        result = resolve_mv(title, artist, duration, force=force)
+    except Exception as exc:
+        log.warning("MV resolution failed for %r | %r: %s", title, artist, exc)
+        result = None
+    if result is None:
+        # Transient upstream failure — never cached, safe to retry.
+        return jsonify({"hasMV": False, "reason": "unavailable", "tid": get_track_id(title, artist)}), 200
+    result = dict(result)
+    result.setdefault("tid", get_track_id(title, artist))
+    # Deliberately NO intro-offset work here: the measurement costs multiple
+    # audio extractions and must never delay the hover preview from arming.
+    # The client fetches it separately via /api/mv/offset once the video is
+    # already live; cached entries carry a previously measured offset along.
+    return jsonify(result)
+
+
+@app.route("/api/mv/ping", methods=["POST"])
+def api_mv_ping():
+    """Client heartbeat: proves which MV engine version the renderer is
+    actually executing. PyInstaller deployments and stale WebView caches can
+    serve old player.html builds; the version file makes that visible."""
+    data = request.get_json(silent=True) or {}
+    try:
+        (BASE_DIR / "mv_client_version.txt").write_text(json.dumps({
+            "version": data.get("v"),
+            "at": time.time(),
+            "iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }), encoding="utf-8")
+    except Exception as exc:
+        log.debug("MV client ping could not be recorded: %s", exc)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mv/offset")
+def api_mv_offset():
+    """Acoustic intro alignment — the background half of the MV flow.
+
+    The client fires this AFTER the hover preview is already attached, so
+    the multi-second measurement (two bounded audio extractions + envelope
+    correlation) never blocks the video from appearing. Results persist in
+    the 45-day resolution entry; a failed measurement stamps an attempt
+    marker and retries only after the cooldown — never per viewer-open."""
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+    duration = _coerce_duration_seconds(request.args.get("duration"))
+    if not title or not artist:
+        return jsonify({"error": "title and artist required"}), 400
+    _burst_check("mv_offset", f"{title[:30]} | {artist[:20]}")
+    try:
+        result = resolve_mv(title, artist, duration)
+    except Exception as exc:
+        log.warning("MV offset resolve failed for %r | %r: %s", title, artist, exc)
+        result = None
+    if not isinstance(result, dict) or not result.get("hasMV"):
+        return jsonify({"introOffset": None, "tid": get_track_id(title, artist)})
+    if result.get("introOffset") is not None:
+        # Already measured (including a confirmed 0.0 alignment): instant.
+        return jsonify({"introOffset": result["introOffset"], "tid": get_track_id(title, artist)})
+    attempt_age = time.time() - float(result.get("introOffsetAttempt") or 0)
+    if attempt_age <= _MV_OFFSET_RETRY_SEC:
+        return jsonify({"introOffset": None, "tid": get_track_id(title, artist)})
+    measured = None
+    try:
+        measured = _mv_resolve_intro_offset(result.get("mvVideoId") or "", title, artist, duration)
+    except Exception as exc:
+        log.debug("MV intro offset failed for %r: %s", title, exc)
+    if measured is not None:
+        result["introOffset"] = measured
+        result.pop("introOffsetAttempt", None)
+    else:
+        # NEVER cement an unmeasured value as fact — retry after cooldown.
+        result["introOffsetAttempt"] = time.time()
+    if result.get("identity"):
+        entry = {k: v for k, v in result.items() if k not in ("cached", "tid")}
+        try:
+            _cache_mv_resolution(result["identity"], entry)
+        except Exception as exc:
+            log.debug("MV offset could not be persisted: %s", exc)
+    return jsonify({
+        "introOffset": measured,
+        "tid": get_track_id(title, artist),
+        "identity": result.get("identity") or "",
+    })
+
+
+@app.route("/api/mv/stream")
+def api_mv_stream():
+    """Resolve a proxy-served video stream for an official music video.
+
+    Returns a /api/proxy_stream URL under a "mv:{tid}:{cap}" key, so Range
+    seeking, stale-eviction and restart persistence apply with zero proxy
+    changes. The client <video> element must be muted and slaved to the audio
+    pipeline (audio master / video slave). max_height is clamped to the
+    allowed rungs — an arbitrary value never reaches yt-dlp. force=1 is the
+    stale-URL retry path for the client's video error handler."""
+    tid = request.args.get("tid", "")
+    vid = request.args.get("vid", "") or request.args.get("mvVideoId", "")
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+    duration = _coerce_duration_seconds(request.args.get("duration"))
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
+    try:
+        max_height = int(request.args.get("max_height") or _MV_DEFAULT_MAX_HEIGHT)
+    except (TypeError, ValueError):
+        max_height = _MV_DEFAULT_MAX_HEIGHT
+    if max_height not in _MV_ALLOWED_HEIGHTS:
+        max_height = _MV_DEFAULT_MAX_HEIGHT
+    if not tid and title and artist:
+        tid = get_track_id(title, artist)
+    if not tid:
+        return jsonify({"error": "tid (or title+artist) required"}), 400
+    _burst_check("mv_stream", tid)
+    if not vid:
+        # Lazy MV identity resolution — usually a Phase 1 cache hit.
+        resolved = resolve_mv(title, artist, duration) if title and artist else None
+        if not resolved or not resolved.get("hasMV"):
+            return jsonify({"error": "No official music video for this track", "hasMV": False}), 404
+        vid = str(resolved.get("mvVideoId") or "")
+    if force:
+        _mv_media_cache.invalidate(vid, max_height)
+    elif _mv_media_cache.complete(vid, max_height):
+        return jsonify({
+            "url": f"/api/mv/cached?vid={vid}&cap={max_height}",
+            "maxHeight": max_height, "videoId": vid, "transport": "disk", "cached": True,
+        })
+    try:
+        result = resolve_mv_stream_singleflight(vid, tid, max_height, force=force)
+    except Exception as exc:
+        log.warning("MV stream resolution failed for vid=%s: %s", vid, exc)
+        result = {"error": str(exc)}
+    if "error" in result:
+        return jsonify(result), 502
+    url_key = _mv_stream_cache_key(tid, max_height)
+    return jsonify({
+        "url": f"/api/proxy_stream?url_key={url_key}",
+        "maxHeight": result.get("maxHeight") or 0,
+        "source": result.get("source") or "",
+        "videoId": vid,
+        "transport": "proxy",
+        "cached": bool(result.get("cached")),
+    })
+
+
+@app.route("/api/mv/cached")
+def api_mv_cached():
+    try:
+        cap = int(request.args.get('cap', 1080))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid video quality"}), 400
+    file = _mv_media_cache.complete(request.args.get('vid', ''), cap)
+    if not file:
+        return jsonify({"error": "Video cache miss", "stale": True}), 404
+    # Flask's conditional file serving preserves byte-range seeking.
+    return send_from_directory(file.parent, file.name, conditional=True)
 
 
 @app.route("/api/media/status", methods=["POST"])
@@ -3884,6 +5422,99 @@ def api_media_status():
         "count": len(clean_tids),
     })
 
+def _mv_pipelined_generate(upstream, chunk_size: int = 262144, max_queued: int = 16):
+    """Readahead-pipelined response generator for HD-video proxying.
+
+    The synchronous copy loop couples downstream delivery to upstream
+    jitter: every TLS/CDN stall on googlevideo surfaced as a visible video
+    stall. This variant decouples them — a daemon producer fills a bounded
+    queue (~4MB) ahead while the client consumes at full local-socket
+    speed. VIDEO-ONLY: the audio path keeps the original byte-identical
+    generator. Producer and generator both guard with `done` + timeouts so
+    a client disconnect or a dead producer can never leak a connection."""
+    buffer_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=max_queued)
+    done = threading.Event()
+
+    def enqueue(chunk):
+        # Check disconnects while backpressure holds the queue full. A single
+        # 30s put kept the producer and buffered chunks alive after Chromium
+        # had already abandoned this range request.
+        deadline = time.monotonic() + 30
+        while not done.is_set():
+            try:
+                buffer_q.put(chunk, timeout=0.1)
+                return True
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    return False
+        return False
+
+    def produce():
+        try:
+            if done.is_set():
+                return
+            for chunk in upstream.iter_content(chunk_size=chunk_size):
+                if done.is_set():
+                    return
+                if chunk and not enqueue(chunk):
+                    return
+            enqueue(None)  # natural end sentinel
+        except Exception:
+            try:
+                buffer_q.put_nowait(None)
+            except Exception:
+                pass  # consumer gone: queue full/dead is fine, thread exits
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=produce, daemon=True, name="mv-proxy-readahead").start()
+    try:
+        for chunk in iter(lambda: buffer_q.get(timeout=60), None):
+            # No small first slice here: that contract exists for AUDIO
+            # time-to-first-byte. Video startup needs the header+cues parsed
+            # and a playable window buffered FAST — bulk delivery from the
+            # first yield minimises Chromium's progressive stall-refetch
+            # churn at the beginning of the stream.
+            yield chunk
+    finally:
+        done.set()
+        try:
+            upstream.close()  # unblocks the producer's stalled read on disconnect
+        except Exception:
+            pass
+
+
+def _generate_proxy_body(upstream):
+    """Synchronous copy for the audio path — byte-identical to the original
+    inline generator. Being a generator FUNCTION itself means calling it
+    yields a generator (the refactor bug handed werkzeug the function)."""
+    try:
+        # First yield stays small so audio time-to-first-byte is
+        # unchanged; subsequent chunks are large enough that the
+        # multi-Mbps HD-video stream does not become Python-bound
+        # (32KB chunks at 3-5 Mbps meant ~150+ generator yields/sec).
+        first = True
+        for chunk in upstream.iter_content(chunk_size=131072):
+            if not chunk:
+                continue
+            if first:
+                first = False
+                yield chunk[:32768]
+                rest = chunk[32768:]
+                if rest:
+                    yield rest
+            else:
+                yield chunk
+    finally:
+        try:
+            upstream.close()
+        except Exception:
+            pass
+
+
 @app.route("/api/proxy_stream")
 def api_proxy_stream():
     url_key = request.args.get("url_key", "")
@@ -3894,6 +5525,10 @@ def api_proxy_stream():
         return jsonify({"error": "Stream URL expired or not found", "stale": True}), 404
     entry = cached if isinstance(cached, dict) else {"url": cached}
     url = entry["url"]
+    if str(url_key).startswith(_MV_STREAM_KEY_PREFIX):
+        file = _mv_media_cache.complete(entry.get('matchedVideoId'), int(str(url_key).rsplit(':', 1)[-1]))
+        if file:
+            return send_from_directory(file.parent, file.name, conditional=True)
     # Pre-empt: if the YouTube `expire=` token has already passed, evict and signal stale.
     exp = entry.get("exp") or 0
     if exp and exp <= time.time():
@@ -3968,20 +5603,17 @@ def api_proxy_stream():
         if upstream.headers.get("Content-Encoding"):
             excluded.add("content-length")
         resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in excluded}
-        def generate():
-            try:
-                # A smaller first yield lowers time-to-first-audio in Android
-                # WebView while remaining large enough to avoid Python-heavy
-                # per-chunk overhead on sustained playback.
-                for chunk in upstream.iter_content(chunk_size=32768):
-                    if chunk:
-                        yield chunk
-            finally:
-                try:
-                    upstream.close()
-                except Exception:
-                    pass
-        return Response(generate(), status=upstream.status_code, headers=resp_headers, mimetype=upstream.headers.get("Content-Type", "audio/mp4"))
+        # HD video streams get the readahead pipeline (decoupled from upstream
+        # jitter, ~4MB bounded); audio keeps the original synchronous copy so
+        # its battle-tested behaviour is byte-identical.
+        body_generator = (_mv_pipelined_generate(upstream)
+                         if str(url_key).startswith(_MV_STREAM_KEY_PREFIX)
+                         else _generate_proxy_body(upstream))
+        if str(url_key).startswith(_MV_STREAM_KEY_PREFIX):
+            body_generator = _mv_media_cache.capture(
+                entry.get('matchedVideoId'), int(str(url_key).rsplit(':', 1)[-1]),
+                upstream.status_code, upstream.headers, body_generator)
+        return Response(body_generator, status=upstream.status_code, headers=resp_headers, mimetype=upstream.headers.get("Content-Type", "audio/mp4"))
     except Exception as e:
         print(f"[PROXY] ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 502
@@ -4106,6 +5738,71 @@ def api_stats_log():
         _save_stats_locked(data)
         _invalidate_stats_cache()
     return jsonify({"ok": True})
+
+
+def _song_listening_totals(data: dict, identifiers: set) -> dict:
+    """Count one recording across raw, rolled, and merged device history."""
+    plays = seconds = 0
+    for event in data.get("raw", []):
+        if event.get("id") in identifiers:
+            plays += 1 if event.get("play") == 1 else 0
+            seconds += int(event.get("sec", 0) or 0)
+    for tier in ("daily", "monthly"):
+        for rows in data.get(tier, {}).values():
+            for identifier in identifiers:
+                row = rows.get(identifier, {})
+                plays += int(row.get("count", 0) or 0)
+                seconds += int(row.get("seconds", 0) or 0)
+    return {"plays": plays, "seconds": seconds}
+
+
+def _song_in_collection(directory: Path, tid: str, video_id: str) -> bool:
+    """Read membership metadata without decoding media or backfilling files."""
+    def read(path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def matches(track):
+        return bool((tid and track.get("tid") == tid) or
+                    (video_id and track.get("videoId") == video_id))
+
+    playlist = read(directory / "playlist.json")
+    if playlist.get("accountDeleted"):
+        return False
+    if "accountItems" in playlist:
+        items = playlist["accountItems"]
+        return isinstance(items, list) and any(matches(item.get("track", {})) for item in items
+                   if isinstance(item, dict) and isinstance(item.get("track"), dict))
+    if tid:
+        metadata = read(directory / f"{tid}.meta.json")
+        return bool(metadata) and (not metadata.get("tid") or metadata.get("tid") == tid)
+    return any(matches(read(path)) for path in directory.glob("*.meta.json"))
+
+
+@app.route("/api/song/context")
+def api_song_context():
+    """Engagement-only local context; never search or resolve streams/artwork."""
+    tid = (request.args.get("tid") or "").strip()
+    video_id = (request.args.get("videoId") or "").strip()
+    if (tid and not re.fullmatch(r"[a-fA-F0-9]{32}", tid)) or len(video_id) > 128:
+        return jsonify({"error": "Invalid song identity"}), 400
+    identifiers = {value for value in (tid, video_id) if value}
+    if not identifiers:
+        return jsonify({"error": "Song identity required"}), 400
+    with _stats_lock:
+        data = account_stats.aggregate_document(_load_stats_locked())
+    result = _song_listening_totals(data, identifiers)
+    collections = []
+    for collection in _get_playlist_index():
+        name = collection["name"]
+        if _song_in_collection(PLAYLISTS_DIR / name, tid, video_id):
+            collections.append({key: collection.get(key) for key in
+                                ("name", "coverArt", "isAlbum", "albumId", "count")})
+    result["collections"] = collections
+    return jsonify(result)
 
 
 @app.route("/api/stats/get")
@@ -4692,17 +6389,22 @@ def _get_playlist_index():
     global _playlist_index_cache
     with _playlist_index_lock:
         cached = _playlist_index_cache
-        generation = _playlist_index_generation
     if cached is not None:
         return cached
-    # Never hold the cache lock while acquiring per-playlist locks. Writers
-    # invalidate the cache after releasing their playlist lock, which gives us
-    # one consistent lock order and avoids scan/write deadlocks.
-    scanned = _scan_playlists()
-    with _playlist_index_lock:
-        if _playlist_index_cache is None and generation == _playlist_index_generation:
-            _playlist_index_cache = scanned
-        return _playlist_index_cache if _playlist_index_cache is not None else scanned
+    # One catalog scan per cold generation. This separate lock is never acquired
+    # by mutation routes; do not hold the cache lock across per-playlist reads.
+    with _playlist_scan_lock:
+        with _playlist_index_lock:
+            cached = _playlist_index_cache
+            generation = _playlist_index_generation
+        if cached is not None:
+            return cached
+        scanned = _scan_playlists()
+        with _playlist_index_lock:
+            if _playlist_index_cache is None and generation == _playlist_index_generation:
+                _playlist_index_cache = scanned
+            return _playlist_index_cache if _playlist_index_cache is not None else scanned
+
 
 def _invalidate_playlist_cache():
     global _playlist_index_cache, _playlist_index_generation
@@ -5686,12 +7388,23 @@ def _apply_playlist_import(parsed: dict, mode: str, requested_name: str) -> dict
 @app.route("/api/library_file")
 def api_library_file():
     q = request.args.get("q", "")
-    if "\\" in q:
+    if "\\" in q or "\x00" in q:
         return jsonify({"error": "Not found"}), 404
     parts = q.split("/")
     filename = parts[-1]
-    if not filename or filename in (".", "..") or not _SAFE_FILENAME_RE.fullmatch(filename):
+    if not filename or filename in (".", ".."):
         return jsonify({"error": "Not found"}), 404
+    # Traversal safety here comes from STRUCTURE, not a filename charset:
+    #   - the one-part branch resolves exclusively through the scanned media
+    #     index (real basenames of files physically under PLAYLISTS_DIR), and
+    #   - the two-part branch re-resolves and is_relative_to-checks against
+    #     PLAYLISTS_DIR, with the collection name additionally rejecting ':'.
+    # The old _SAFE_FILENAME_RE gate additionally forbade SPACES — but the
+    # app's own playlist downloads are stored as '04 - <tid>.mp3' (album
+    # ordering), so every such file 404'd on serve and its track could never
+    # play (real case: 'As It Was' — a valid local MP3, handed out by
+    # /api/stream, then rejected here; /api/stream always prefers local, so
+    # the same dead URL came back forever).
     if len(parts) > 1:
         # Album covers share a filename: preserve the requested collection path.
         if len(parts) != 2 or parts[0] in ("", ".", "..") or ":" in parts[0]:
@@ -5734,9 +7447,8 @@ def api_settings():
 def api_settings_wipe():
     """Reset flat-file user state and clear SAVED cache without removing playlists."""
     global _settings_cache, _settings_cache_ts
-    global _community_cache, _community_cache_ts, _pinned_art_cache, _pinned_art_cache_ts
 
-    defaults = {"ui_layout_mode": "card", "cache_limit_gb": 5, "community_showcase_enabled": True}
+    defaults = {"ui_layout_mode": "card", "cache_limit_gb": 5}
     failed = 0
     removed = 0
 
@@ -5774,12 +7486,6 @@ def api_settings_wipe():
 
     with _lyrics_mem_lock:
         _lyrics_mem_cache.clear()
-    with _community_cache_lock:
-        _community_cache = None
-        _community_cache_ts = 0.0
-    with _pinned_art_lock:
-        _pinned_art_cache = None
-        _pinned_art_cache_ts = 0.0
     with _download_status_lock:
         _download_status.clear()
     _invalidate_stream_cache()
@@ -5793,14 +7499,6 @@ def api_toggle_layout():
     settings["ui_layout_mode"] = "list" if current == "card" else "card"
     _save_settings(settings)
     return jsonify(settings)
-
-@app.route("/api/settings/toggle_community_showcase", methods=["POST"])
-def api_toggle_community_showcase():
-    settings = _load_settings()
-    settings["community_showcase_enabled"] = not settings.get("community_showcase_enabled", True)
-    _save_settings(settings)
-    return jsonify(settings)
-
 
 @app.route("/api/youtube/refresh_auth", methods=["POST"])
 def api_refresh_youtube_auth():
@@ -6181,6 +7879,8 @@ def api_playlists_delete():
     safe_name = _safe_playlist_name(name)
     if not safe_name or not _validate_playlist_path(safe_name):
         return jsonify({"error": "Invalid playlist name"}), 400
+    if safe_name.strip().lower() == "spotify likes":
+        return jsonify({"error": "Spotify Likes cannot be deleted"}), 403
     try:
         with _playlist_catalog_lock:
             with _playlist_guard(safe_name):
@@ -7213,774 +8913,6 @@ def api_downloads_status():
     _downloads_status_cache = result
     _downloads_status_cache_ts = time.time()
     return jsonify(result)
-
-# ── Community discover helpers ───────────────────────────────────────────────
-
-def _load_community_cache() -> dict:
-    global _community_cache, _community_cache_ts
-    now = time.time()
-    if _community_cache is not None and (now - _community_cache_ts) < _COMMUNITY_CACHE_TTL:
-        return dict(_community_cache)
-    if COMMUNITY_CACHE_JSON.exists():
-        try:
-            _community_cache = json.loads(COMMUNITY_CACHE_JSON.read_text(encoding="utf-8"))
-        except Exception:
-            _community_cache = {}
-    else:
-        _community_cache = {}
-    _community_cache_ts = now
-    return dict(_community_cache)
-
-def _save_community_cache(data: dict):
-    global _community_cache, _community_cache_ts
-    try:
-        COMMUNITY_CACHE_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning(f"Failed to write community cache: {e}")
-    _community_cache = dict(data)
-    _community_cache_ts = time.time()
-
-# ── Community Discover background warmup ────────────────────────────────
-# A cold /api/community/discover costs ~10-20s of artwork lookups and runs
-# on the first Discover visit of each hour (hourly-seeded sample). This
-# daemon precomputes it once after boot settles, then re-warms shortly
-# after each hour boundary, so visits served from the 1h cache (~2ms).
-# Best-effort only: every failure mode is swallowed, favorites-absent
-# instances do no work, and nothing starts unless a server entry point
-# calls maybe_start_community_warmup() (importing app never spawns threads,
-# so unit tests are unaffected).
-_community_warmup_started = False
-_community_warmup_lock = threading.Lock()
-_community_warmup_inflight = False
-
-def _community_warm_once():
-    """Run one discover computation to populate the cache. Never raises."""
-    global _community_warmup_inflight
-    if _community_warmup_inflight:
-        return
-    _community_warmup_inflight = True
-    try:
-        try:
-            favs = _load_favorites()
-        except Exception:
-            favs = []
-        if not favs:
-            return
-        # Route has no query params; request context is only needed for jsonify.
-        with app.test_request_context():
-            api_community_discover()
-    except Exception as e:
-        log.debug(f"Community warmup skipped: {e}")
-    finally:
-        _community_warmup_inflight = False
-
-def _community_warmup_loop():
-    # Let auth, first paint, and first playback win the boot CPU (yt-dlp
-    # extraction is CPU-heavy); Discover can wait under a minute.
-    time.sleep(45)
-    _community_warm_once()
-    while True:
-        # Wake ~2min past the next hour boundary (new seed → new sample),
-        # plus jitter so fleets don't thunder.
-        now = time.time()
-        nxt = (int(now // 3600) + 1) * 3600 + 120 + random.uniform(0, 60)
-        time.sleep(max(60.0, nxt - now))
-        _community_warm_once()
-
-def maybe_start_community_warmup():
-    """Idempotent; call once from each server entry point after startup."""
-    global _community_warmup_started
-    with _community_warmup_lock:
-        if _community_warmup_started:
-            return
-        _community_warmup_started = True
-    threading.Thread(
-        target=_community_warmup_loop,
-        name="aki-community-warm",
-        daemon=True,
-    ).start()
-
-def _load_pinned_art() -> list:
-    global _pinned_art_cache, _pinned_art_cache_ts
-    now = time.time()
-    if _pinned_art_cache is not None and (now - _pinned_art_cache_ts) < _PINNED_ART_CACHE_TTL:
-        return list(_pinned_art_cache)
-    if PINNED_ART_JSON.exists():
-        try:
-            _pinned_art_cache = json.loads(PINNED_ART_JSON.read_text(encoding="utf-8"))
-            if not isinstance(_pinned_art_cache, list):
-                _pinned_art_cache = []
-        except Exception:
-            _pinned_art_cache = []
-    else:
-        _pinned_art_cache = []
-    _pinned_art_cache_ts = now
-    return list(_pinned_art_cache)
-
-def _save_pinned_art(data: list):
-    global _pinned_art_cache, _pinned_art_cache_ts
-    try:
-        PINNED_ART_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning(f"Failed to write pinned art: {e}")
-    _pinned_art_cache = list(data)
-    _pinned_art_cache_ts = time.time()
-
-def _musicbrainz_search(query: str) -> list:
-    """Search MusicBrainz for releases. Returns list of dicts with 'id' and 'title'."""
-    try:
-        resp = _musicbrainz_session.get(
-            "https://musicbrainz.org/ws/2/release",
-            params={"query": query, "fmt": "json", "limit": 5},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("releases", [])
-        log.debug(f"MusicBrainz search returned {resp.status_code} for query: {query}")
-    except Exception as e:
-        log.debug(f"MusicBrainz search failed for '{query}': {e}")
-    return []
-
-# ── Resolution enforcement ────────────────────────────────────────────────────
-_LOW_RES_MARKERS = ("250px", "100px", "50px", "250-", "100-", "50-",
-                    "=s100", "=s200", "=s250", "=s500",
-                    "/small", "/medium", "/thumbnail",
-                    "thumb_", "_small", "_medium")
-
-def _is_low_res_url(url: str) -> bool:
-    """Return True if URL points to a known low-resolution thumbnail."""
-    lower = url.lower()
-    return any(m in lower for m in _LOW_RES_MARKERS)
-
-def _fetch_cover_art(mbid: str) -> list:
-    """Fetch structured cover art data from Cover Art Archive for a given MBID.
-
-    Returns list of dicts: {url, front, types, asset_id, has_master}.
-    Only includes images that pass the strict resolution filter — low-res
-    thumbnails (250, 500, small, medium) are discarded.
-    """
-    try:
-        resp = _musicbrainz_session.get(
-            f"https://coverartarchive.org/release/{mbid}",
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            images = data.get("images", [])
-            results = []
-            for img in images:
-                image_url = img.get("image", "")
-                if not image_url:
-                    continue
-                if _is_low_res_url(image_url):
-                    continue
-                asset_id = hashlib.md5(image_url.encode()).hexdigest()
-                has_master = bool(img.get("approved"))
-                results.append({
-                    "url": image_url,
-                    "front": bool(img.get("front", False)),
-                    "types": img.get("types", []),
-                    "asset_id": asset_id,
-                    "has_master": has_master,
-                })
-            return results
-    except Exception as e:
-        log.debug(f"Cover Art Archive fetch failed for {mbid}: {e}")
-    return []
-
-
-def _fetch_ytmusic_artist_header(artist_name: str) -> list:
-    """Fetch high-res artist banner/header imagery from YouTube Music artist profile.
-
-    Uses ytmusic.get_artist() to retrieve the official artist page header and
-    banner images. Returns list of dicts: {url, type, asset_id, width, height}.
-    Only returns images that are wider than tall (banners) or square (thumbnails).
-    """
-    results = []
-    try:
-        search_results = ytmusic.search(artist_name, filter="artists", limit=3)
-        if not search_results:
-            return results
-        target = artist_name.lower().strip()
-        best_browse = None
-        for r in search_results:
-            if r.get("browseId"):
-                r_name = (r.get("name") or "").lower().strip()
-                if r_name == target:
-                    best_browse = r["browseId"]
-                    break
-        if not best_browse:
-            for r in search_results:
-                if r.get("browseId"):
-                    best_browse = r["browseId"]
-                    break
-        if not best_browse:
-            return results
-
-        artist_data = ytmusic.get_artist(best_browse)
-        if not artist_data:
-            return results
-
-        seen_ids = set()
-
-        # Header / banner images (wide-format, highest resolution)
-        for thumb in (artist_data.get("thumbnails") or []):
-            url = thumb.get("url", "")
-            if not url or _is_low_res_url(url):
-                continue
-            # Strip YouTube dimension params and request max resolution
-            clean_url = re.sub(r'=w\d+-h\d+.*', '', url)
-            if not clean_url:
-                continue
-            asset_id = hashlib.md5(clean_url.encode()).hexdigest()
-            if asset_id in seen_ids:
-                continue
-            seen_ids.add(asset_id)
-            w = thumb.get("width", 0)
-            h = thumb.get("height", 0)
-            results.append({
-                "url": clean_url,
-                "type": "artist-header",
-                "asset_id": asset_id,
-                "width": w,
-                "height": h,
-            })
-
-        # Banner images from artist page sections
-        for section_key in ("header", "banner"):
-            banner = artist_data.get(section_key)
-            if isinstance(banner, dict):
-                for thumb in (banner.get("thumbnails") or []):
-                    url = thumb.get("url", "")
-                    if not url or _is_low_res_url(url):
-                        continue
-                    clean_url = re.sub(r'=w\d+-h\d+.*', '', url)
-                    if not clean_url:
-                        continue
-                    asset_id = hashlib.md5(clean_url.encode()).hexdigest()
-                    if asset_id in seen_ids:
-                        continue
-                    seen_ids.add(asset_id)
-                    w = thumb.get("width", 0)
-                    h = thumb.get("height", 0)
-                    results.append({
-                        "url": clean_url,
-                        "type": "artist-header",
-                        "asset_id": asset_id,
-                        "width": w,
-                        "height": h,
-                    })
-
-        # Sort by width descending — prefer widest banner
-        results.sort(key=lambda x: x.get("width", 0), reverse=True)
-    except Exception as e:
-        log.debug(f"YTMusic artist header fetch failed for '{artist_name}': {e}")
-    return results
-
-
-def _fetch_artist_portrait(artist_name: str) -> list:
-    """Fallback: fetch artist portrait from MusicBrainz relations + Wikipedia.
-
-    Requests the highest-resolution Wikipedia thumbnail available (up to 1000px).
-    Returns list of dicts: {url, type, asset_id}.
-    """
-    try:
-        resp = _musicbrainz_session.get(
-            "https://musicbrainz.org/ws/2/artist/",
-            params={"query": artist_name, "fmt": "json", "limit": 3},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return []
-        artists = resp.json().get("artists", [])
-        if not artists:
-            return []
-
-        target = artist_name.lower().strip()
-        best = None
-        for a in artists:
-            a_name = (a.get("name") or "").lower().strip()
-            if a_name == target:
-                best = a
-                break
-        if not best:
-            best = artists[0]
-
-        artist_mbid = best.get("id", "")
-        if not artist_mbid:
-            return []
-
-        rel_resp = _musicbrainz_session.get(
-            f"https://musicbrainz.org/ws/2/artist/{artist_mbid}",
-            params={"fmt": "json", "inc": "url-rels"},
-            timeout=10,
-        )
-        if rel_resp.status_code != 200:
-            return []
-
-        relations = rel_resp.json().get("relations", [])
-        wiki_url = None
-        for rel in relations:
-            url_info = rel.get("url", {})
-            resource = url_info.get("resource", "")
-            if "wikipedia.org/wiki/" in resource:
-                wiki_url = resource
-                break
-
-        if not wiki_url:
-            return []
-
-        wiki_title = wiki_url.split("/wiki/", 1)[-1]
-        wiki_title = wiki_title.replace("_", " ")
-        encoded_title = urllib.parse.quote(wiki_title, safe="")
-
-        summary_resp = _musicbrainz_session.get(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded_title}",
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-        if summary_resp.status_code != 200:
-            return []
-
-        summary = summary_resp.json()
-        thumbnail = summary.get("thumbnail", {})
-        img_source = thumbnail.get("source", "")
-        if not img_source:
-            return []
-
-        # Request the highest-resolution version available (up to 1000px)
-        large_url = re.sub(r'/(\d+)px-', '/1000px-', img_source)
-        asset_id = hashlib.md5(large_url.encode()).hexdigest()
-
-        return [{
-            "url": large_url,
-            "type": "artist-portrait",
-            "asset_id": asset_id,
-        }]
-    except Exception as e:
-        log.debug(f"Artist portrait fetch failed for '{artist_name}': {e}")
-    return []
-
-
-def _classify_layout_type(image_data: dict) -> str:
-    """Determine structural layout tag for an image asset.
-
-    - 'wide-rect': wide-format artist banner / landscape image
-    - 'giant-square': rare high-resolution pinned feature
-    - 'square': default for standard album art
-    """
-    img_type = image_data.get("type", "")
-
-    # Artist headers and banners are inherently wide
-    if img_type in ("artist-header", "artist-portrait"):
-        return "wide-rect"
-
-    # If width/height known and aspect ratio > 1.3, treat as wide
-    w = image_data.get("width", 0)
-    h = image_data.get("height", 0)
-    if w > 0 and h > 0 and (w / h) > 1.3:
-        return "wide-rect"
-
-    types = image_data.get("types", [])
-    url = image_data.get("url", "")
-
-    # Full-resolution CAA front covers are high-res pinned features
-    if "coverartarchive.org" in url and not _is_low_res_url(url):
-        if image_data.get("front") or "Front" in types:
-            return "giant-square"
-
-    # Approved/master images at full resolution
-    if image_data.get("has_master") and not _is_low_res_url(url):
-        return "giant-square"
-
-    return "square"
-
-
-def _discover_art_for_item(artist: str, song: str = "", fav: dict = None, _artist_memo: dict = None) -> list:
-    """Strict 3-stage fallback pipeline — always returns ≥1 valid image.
-
-    Stage 1 (Track Search): MusicBrainz/Cover Art Archive for the specific song.
-    Stage 2 (Artist-Only): YouTube Music artist profile header/portrait imagery.
-    Stage 3 (Local Fail-safe): Native cover art from the user's favorites metadata.
-
-    Returns list of dicts: {url, artist, song, asset_id, layout_type, source}.
-    Guaranteed non-empty — Stage 3 ensures every track gets at least one image.
-
-    _artist_memo optionally dedupes the artist-scoped Stage 2 network calls
-    across items sharing an artist within one request (pure function of the
-    artist name, so shared results are identical).
-    """
-    fav = fav or {}
-    seen_asset_ids = set()
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 1 — Track Search (MusicBrainz + Cover Art Archive)
-    # ════════════════════════════════════════════════════════════════════════
-    all_assets = []
-    query = f"{artist} {song}".strip()
-    releases = _musicbrainz_search(query)
-    if not releases:
-        releases = _musicbrainz_search(artist)
-
-    for release in releases[:3]:
-        mbid = release.get("id", "")
-        if not mbid:
-            continue
-        cover_assets = _fetch_cover_art(mbid)
-        for asset in cover_assets:
-            aid = asset["asset_id"]
-            if aid in seen_asset_ids:
-                continue
-            seen_asset_ids.add(aid)
-            all_assets.append(asset)
-        if len(all_assets) >= 10:
-            break
-
-    # Evaluate track search quality
-    has_high_res = any(
-        a.get("has_master") or not _is_low_res_url(a.get("url", ""))
-        for a in all_assets
-    )
-    track_sufficient = len(all_assets) > 0 and has_high_res
-
-    if track_sufficient:
-        results = []
-        for asset in all_assets:
-            layout = _classify_layout_type(asset)
-            results.append({
-                "url": asset["url"],
-                "artist": artist,
-                "song": song,
-                "asset_id": asset["asset_id"],
-                "layout_type": layout,
-                "source": "cover-art-archive",
-            })
-        return results
-
-    # Track search returned assets but they're insufficient — keep the best one
-    # as a guaranteed fallback before trying artist-only search
-    stage1_best = None
-    if all_assets:
-        # Prefer front covers, then approved/master, then first available
-        front_covers = [a for a in all_assets if a.get("front")]
-        if front_covers:
-            stage1_best = front_covers[0]
-        else:
-            stage1_best = all_assets[0]
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 2 — Artist-Only Fallback (YTMusic artist profile)
-    # ════════════════════════════════════════════════════════════════════════
-    artist_headers = []
-    if artist:
-        _memo_key = ("header", artist.lower().strip())
-        if _artist_memo is not None and _memo_key in _artist_memo:
-            artist_headers = _artist_memo[_memo_key]
-        else:
-            artist_headers = _fetch_ytmusic_artist_header(artist)
-            if _artist_memo is not None:
-                _artist_memo[_memo_key] = artist_headers
-
-    if not artist_headers and artist:
-        _memo_key = ("portrait", artist.lower().strip())
-        if _artist_memo is not None and _memo_key in _artist_memo:
-            artist_headers = _artist_memo[_memo_key]
-        else:
-            artist_headers = _fetch_artist_portrait(artist)
-            if _artist_memo is not None:
-                _artist_memo[_memo_key] = artist_headers
-
-    if artist_headers:
-        results = []
-        # Include the best Stage 1 asset alongside artist imagery
-        if stage1_best:
-            aid = stage1_best["asset_id"]
-            if aid not in seen_asset_ids:
-                seen_asset_ids.add(aid)
-                results.append({
-                    "url": stage1_best["url"],
-                    "artist": artist,
-                    "song": song,
-                    "asset_id": aid,
-                    "layout_type": _classify_layout_type(stage1_best),
-                    "source": "cover-art-archive",
-                })
-        for header in artist_headers:
-            asset_id = header.get("asset_id", "")
-            if asset_id in seen_asset_ids:
-                continue
-            seen_asset_ids.add(asset_id)
-            layout = _classify_layout_type(header)
-            results.append({
-                "url": header["url"],
-                "artist": artist,
-                "song": song,
-                "asset_id": asset_id,
-                "layout_type": layout,
-                "source": "artist-header",
-            })
-        return results
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 3 — Guaranteed Local Fail-safe (favorites native art)
-    # ════════════════════════════════════════════════════════════════════════
-    # 3a: Check local art file first (highest fidelity, already downloaded)
-    tid = fav.get("tid") or get_track_id(song, artist)
-    local_art_path = SAVED_DIR / f"{tid}.jpg"
-    if local_art_path.is_file():
-        art_url = f"/api/local_file?q={tid}.jpg"
-        asset_id = hashlib.md5(art_url.encode()).hexdigest()
-        return [{
-            "url": art_url,
-            "artist": artist,
-            "song": song,
-            "asset_id": asset_id,
-            "layout_type": "square",
-            "source": "local-art",
-        }]
-
-    # 3b: HTTP art URL from favorites metadata
-    art_url = fav.get("art") or fav.get("album_art") or ""
-    if art_url and art_url.startswith(("http://", "https://")):
-        asset_id = hashlib.md5(art_url.encode()).hexdigest()
-        return [{
-            "url": art_url,
-            "artist": artist,
-            "song": song,
-            "asset_id": asset_id,
-            "layout_type": "square",
-            "source": "favorites-fallback",
-        }]
-
-    # 3c: Use the best CAA asset from Stage 1 as last-ditch fallback
-    if stage1_best:
-        aid = stage1_best["asset_id"]
-        return [{
-            "url": stage1_best["url"],
-            "artist": artist,
-            "song": song,
-            "asset_id": aid,
-            "layout_type": _classify_layout_type(stage1_best),
-            "source": "cover-art-archive-fallback",
-        }]
-
-    # 3d: Absolute last resort — YouTube thumbnail (always available for any videoId)
-    video_id = fav.get("videoId", "")
-    if video_id:
-        yt_thumb = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
-        asset_id = hashlib.md5(yt_thumb.encode()).hexdigest()
-        return [{
-            "url": yt_thumb,
-            "artist": artist,
-            "song": song,
-            "asset_id": asset_id,
-            "layout_type": "square",
-            "source": "youtube-thumb",
-        }]
-
-    # Should never reach here, but return empty if truly nothing exists
-    return []
-
-
-@app.route("/api/community/discover")
-def api_community_discover():
-    """Discover alternative artwork from MusicBrainz/Cover Art Archive/YTMusic based on favorites.
-
-    3-stage fallback pipeline ensures every track always gets at least one image:
-      Stage 1: MusicBrainz/Cover Art Archive track search
-      Stage 2: YouTube Music artist profile header/portrait
-      Stage 3: Local art file or native favorites metadata
-
-    Returns images with layout_type tags and asset_id keys for structural layout sizing.
-    Responses are cached in SAVED/community_cache.json keyed by asset_id to prevent
-    redundant backend network calls.
-    """
-    try:
-        favs = _load_favorites()
-        if not favs:
-            return jsonify({"images": [], "source": "none"})
-
-        # Build a lookup map from artist+song → full fav object (for Stage 3)
-        fav_map = {}
-        for fav in favs:
-            a = (fav.get("artist") or "").strip()
-            n = (fav.get("name") or "").strip()
-            if a:
-                fav_map[f"{a.lower()}|{n.lower()}"] = fav
-
-        # Deduplicate by artist+song combo, preserving full fav data
-        seen = set()
-        unique_items = []
-        for fav in favs:
-            artist = fav.get("artist", "").strip()
-            song = fav.get("name", "").strip()
-            if not artist:
-                continue
-            key = f"{artist.lower()}|{song.lower()}"
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_items.append(fav)
-
-        if not unique_items:
-            return jsonify({"images": [], "source": "none"})
-
-        # Sample up to 6 entries for visual variety. The sample is seeded by
-        # the hour plus the library fingerprint (dedicated Random instance, so
-        # global random state is untouched): the same 6 items are picked all
-        # hour, which lets the 1h community cache below actually hit instead of
-        # recomputing ~10s of artwork lookups on every Discover visit.
-        sample_count = min(6, len(unique_items))
-        seed_src = str(int(time.time() // 3600)) + "|" + "|".join(sorted(
-            f"{i.get('artist','')}||{i.get('name','')}" for i in unique_items
-        ))
-        items = random.Random(int(hashlib.md5(seed_src.encode()).hexdigest()[:16], 16)).sample(
-            unique_items, sample_count)
-
-        # Check cache (keyed by sorted artist+song keys)
-        cache_key = "|".join(sorted(
-            f"{i.get('artist','')}||{i.get('name','')}" for i in items
-        ))
-        cache = _load_community_cache()
-        if cache_key in cache:
-            cached = cache[cache_key]
-            # Validate cached results still have valid URLs
-            valid_cached = [
-                img for img in cached
-                if img.get("url") and img["url"].startswith(("http://", "https://", "/"))
-            ]
-            if valid_cached:
-                return jsonify({"images": valid_cached, "source": "cache"})
-
-        # ── 3-Stage Pipeline: every item gets ≥1 guaranteed image ──
-        all_images = []
-        asset_seen = set()
-
-        def _lookup_one(fav_obj):
-            artist = (fav_obj.get("artist") or "").strip()
-            song = (fav_obj.get("name") or "").strip()
-            try:
-                return _discover_art_for_item(artist, song, fav=fav_obj, _artist_memo=_discover_memo)
-            except Exception as e:
-                log.debug(f"Community discover failed for {artist}: {e}")
-            return []
-
-        _discover_memo = {}
-        futures = [_io_executor.submit(_lookup_one, item) for item in items]
-
-        futures = [_io_executor.submit(_lookup_one, item) for item in items]
-        for fut in futures:
-            try:
-                results = fut.result(timeout=15)
-                for r in results:
-                    aid = r.get("asset_id", "")
-                    url = r.get("url", "")
-                    # Accept HTTP URLs and relative paths (local art via /api/stream)
-                    if not url:
-                        continue
-                    if not url.startswith(("http://", "https://", "/")):
-                        continue
-                    if aid and aid not in asset_seen:
-                        asset_seen.add(aid)
-                        all_images.append(r)
-            except Exception:
-                pass
-
-        log.info(f"Community discover: {len(all_images)} unique assets from {len(items)} items")
-
-        # Sanitize: strip any null/empty URL entries that slipped through
-        all_images = [img for img in all_images if img.get("url")]
-
-        # Cache results
-        if all_images:
-            for img in all_images:
-                aid = img.get("asset_id", "")
-                if aid:
-                    cache[f"asset:{aid}"] = img
-            cache[cache_key] = all_images
-            _save_community_cache(cache)
-
-        return jsonify({"images": all_images, "source": "live"})
-    except Exception as e:
-        log.warning(f"Community discover endpoint error: {e}")
-        return jsonify({"images": [], "source": "error"})
-
-@app.route("/api/community/pinned")
-def api_community_pinned():
-    """Return the list of pinned community artworks."""
-    return jsonify(_load_pinned_art())
-
-@app.route("/api/community/pin", methods=["POST"])
-def api_community_pin():
-    """Pin a community artwork: download the image and save metadata."""
-    data = request.get_json(force=True) or {}
-    caid = data.get("caid", "")
-    image_url = data.get("image_url", "")
-    artist = data.get("artist", "")
-    song = data.get("song", "")
-
-    if not caid or not image_url or not artist:
-        return jsonify({"error": "Missing caid, image_url, or artist"}), 400
-
-    # Validate filename pattern
-    if not _SAFE_FILENAME_RE.match(caid):
-        return jsonify({"error": "Invalid caid format"}), 400
-
-    # Validate URL scheme
-    if not image_url.startswith(("http://", "https://")):
-        return jsonify({"error": "Invalid image URL scheme"}), 400
-
-    # Download the image
-    image_path = SAVED_DIR / f"community_{caid}.jpg"
-    try:
-        r = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        image_path.write_bytes(r.content)
-    except Exception as e:
-        return jsonify({"error": f"Failed to download image: {e}"}), 500
-
-    # Append to pinned_art.json
-    pinned = _load_pinned_art()
-    entry = {
-        "caid": caid,
-        "image_url": image_url,
-        "artist": artist,
-        "song": song,
-        "local_path": str(image_path.name),
-    }
-    # Replace existing entry with same caid if present
-    pinned = [p for p in pinned if p.get("caid") != caid]
-    pinned.append(entry)
-    _save_pinned_art(pinned)
-
-    return jsonify({"success": True, "entry": entry})
-
-@app.route("/api/community/unpin", methods=["DELETE"])
-def api_community_unpin():
-    """Unpin a community artwork: remove metadata and delete local image."""
-    data = request.get_json(force=True) or {}
-    caid = data.get("caid", "")
-
-    if not caid:
-        return jsonify({"error": "Missing caid"}), 400
-
-    # Validate filename pattern
-    if not _SAFE_FILENAME_RE.match(caid):
-        return jsonify({"error": "Invalid caid format"}), 400
-
-    # Remove from pinned_art.json
-    pinned = _load_pinned_art()
-    original_len = len(pinned)
-    pinned = [p for p in pinned if p.get("caid") != caid]
-    if len(pinned) == original_len:
-        return jsonify({"error": "Caid not found in pinned art"}), 404
-    _save_pinned_art(pinned)
-
-    # Delete local image file
-    image_path = SAVED_DIR / f"community_{caid}.jpg"
-    image_path.unlink(missing_ok=True)
-
-    return jsonify({"success": True})
 
 @app.route("/api/spotify/embed_proxy")
 def api_spotify_embed_proxy():
@@ -9146,5 +10078,4 @@ except Exception:
 if __name__ == "__main__":
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     print(f"[AkiMelody] server listening on http://{SERVER_BIND_HOST}:{SERVER_PORT}", flush=True)
-    maybe_start_community_warmup()
     app.run(host=SERVER_BIND_HOST, port=SERVER_PORT, debug=False, use_reloader=False)

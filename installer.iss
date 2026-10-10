@@ -10,7 +10,7 @@
 ;  Silent installs (/SILENT /VERYSILENT) auto-relaunch AkiMelody afterward.
 ; ============================================================================
 
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.1.3"
 ; NOTE: Keep in sync with build.py MYAPP_VERSION
 #ifndef BundleDir
 #define BundleDir "dist\AkiMelody"
@@ -19,7 +19,7 @@
 [Setup]
 ; App identity — change AppId per major version to allow side-by-side installs.
 AppId={{AkiMelody-2026-08-05-r1}
-AppVersion=1.1.1
+AppVersion=1.1.3
 AppVerName=AkiMelody {#MyAppVersion}
 AppName=AkiMelody
 AppPublisher=AkiMelody
