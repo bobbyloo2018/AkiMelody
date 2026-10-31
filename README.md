@@ -1,35 +1,48 @@
 # AkiMelody
 
-A self-hosted music player web app that searches, streams, and downloads music from YouTube Music — 
+**A feature-rich, art-first approach to music streaming.**
 
-![Python](https://img.shields.io/badge/Python-3.x-blue) ![Flask](https://img.shields.io/badge/Flask-3.x-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+AkiMelody puts album art at the center of listening. Search anything, hit play, and the whole app shifts around the music: colors, glow, and motion pulled straight from the artwork.
 
----
-
-## Features
-
-- **Instant Search & Play** — Search across YouTube Music and iTunes, click a result and it plays immediately
-- **Real-Time Streaming** — Audio streams directly from YouTube via yt-dlp (no full download required)
-- **Offline Caching** — Tracks are downloaded as MP3s (192kbps) for instant repeat playback
-- **Favorites** — Like tracks with the heart button; persisted to disk and auto-downloaded
-- **Playlists & Albums** — Create playlists, save full albums, reorder tracks
-- **Artist Profiles** — View artist bios (from Wikipedia), discography grouped by album
-- **Card & List Layouts** — Toggle between a compact list view and a 3D-tilted card grid
-- **3D Visual Effects** — Mouse-tracking tilt, specular shine, ambient glow on album art
-- **Glassmorphism UI** — Frosted glass panels, animated backgrounds, smooth transitions
+![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Flask](https://img.shields.io/badge/Flask-3.x-green) ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android-lightgrey) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
-## Quick Start
+## Highlights
 
-### Prerequisites
+- **Art-first design** — 3D-tilting album cards, ambient glow, and a background visualizer themed from each cover
+- **Search and play instantly** — YouTube Music and iTunes results, streamed in real time
+- **Synced lyrics** — follow along line by line
+- **Your library** — favorites, playlists, saved albums, and artist pages with bios
+- **Offline ready** — tracks cache locally for instant replays
+- **Bring your music with you** — import Spotify Likes and link your YouTube Music account
+- **Themes** — community themes, dark and light modes, list or card layouts
+- **Media keys** — play, pause, and skip from your keyboard
 
-- **Python 3.8+**
-- **FFmpeg** — Required for audio conversion. Install via:
-  - Windows: [ffmpeg.org](https://ffmpeg.org/download.html) (add to PATH)
-  - macOS: `brew install ffmpeg`
-  - Linux: `sudo apt install ffmpeg`
+---
 
+## Quick Start (Desktop)
+
+You'll need **Python 3.8+** and **FFmpeg** on your PATH.
+
+```bash
+git clone https://github.com/bobbyloo2018/AkiMelody.git
+cd AkiMelody
+pip install -r requirements.txt
+python app.py
+```
+
+Then open **http://127.0.0.1:5000** in your browser.
+
+Prefer an installer? `python build.py --installer` builds a Windows setup file (needs Inno Setup 6).
+
+---
+
+## Android
+
+An Android version is on the way, sharing the same backend with a mobile player built for touch. Stay tuned.
+
+---
 
 ## License
 
